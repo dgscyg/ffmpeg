@@ -197,6 +197,14 @@ make -j"$JOBS"
 make install
 rm -f "$INSTALL_PREFIX/lib/"libav*.so* "$INSTALL_PREFIX/lib/"libsw*.so*
 
+# 拷贝 x86_64 下的 libvpl 依赖到 SDK 库目录，避免下游编译机因缺失 libvpl-dev 报错
+if [ "$ARCH" = "x86_64" ]; then
+    log "复制系统 libvpl 依赖到 SDK 库目录..."
+    for f in /usr/lib/x86_64-linux-gnu/libvpl.so*; do
+        [ -e "$f" ] && cp -a "$f" "$INSTALL_PREFIX/lib/" 2>/dev/null || true
+    done
+fi
+
 # 6. 打包归档
 log "打包归档 SDK..."
 PKG_NAME="ffmpeg-n${FFMPEG_VER}-linux-${PKG_ARCH}-full.tar.gz"
