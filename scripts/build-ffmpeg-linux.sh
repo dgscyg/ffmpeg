@@ -103,7 +103,8 @@ mkdir -p "$WORK_DIR/svt"
 tar xzf "$WORK_DIR/svt.tgz" -C "$WORK_DIR/svt" --strip-components=1
 cmake -S "$WORK_DIR/svt" -B "$WORK_DIR/svt/build" -G Ninja \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_SHARED_LIBS=OFF -DBUILD_APPS=OFF -DENABLE_TESTING=OFF >/dev/null
+    -DBUILD_SHARED_LIBS=OFF -DBUILD_APPS=OFF -DENABLE_TESTING=OFF \
+    -DENABLE_LTO=OFF -DENABLE_IPO=OFF >/dev/null
 ninja -C "$WORK_DIR/svt/build" -j"$JOBS" install >/dev/null
 
 # 3. 若 aarch64 则构建 rockchip_mpp 静态库
