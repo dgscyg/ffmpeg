@@ -8,17 +8,20 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 FFMPEG_VER="${FFMPEG_VER:-9.0}"
 NV_CODEC_VER="${NV_CODEC_VER:-n12.2.72.0}"
-AMF_TAG="${AMF_TAG:-v1.4.36}"
+AMF_TAG="${AMF_TAG:-v1.5.3}"
 
 INSTALL_PREFIX="${1:-${INSTALL_PREFIX:-/c/tools/ffmpeg-n9}}"
 DIST_DIR="${2:-${DIST_DIR:-${ROOT_DIR}/dist}}"
+mkdir -p "$INSTALL_PREFIX" "$DIST_DIR"
+INSTALL_PREFIX="$(cd "$INSTALL_PREFIX" && pwd)"
+DIST_DIR="$(cd "$DIST_DIR" && pwd)"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 log()  { echo "[ffmpeg-win-build] $*"; }
 fail() { echo "[ffmpeg-win-build] FATAL: $*" >&2; exit 1; }
 
-mkdir -p "$INSTALL_PREFIX/include" "$INSTALL_PREFIX/lib/pkgconfig" "$DIST_DIR"
+mkdir -p "$INSTALL_PREFIX/include" "$INSTALL_PREFIX/lib/pkgconfig"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -40,7 +43,7 @@ fetch_tarball "https://api.github.com/repos/GPUOpen-LibrariesAndSDKs/AMF/tarball
 mkdir -p "$WORK_DIR/amf"
 tar xzf "$WORK_DIR/amf.tgz" -C "$WORK_DIR/amf" --strip-components=1
 mkdir -p "$INSTALL_PREFIX/include/AMF"
-cp -r "$WORK_DIR/amf/amf/public/include/." "$INSTALL_PREFIX/include/AMF/"
+cp -rf "$WORK_DIR/amf/amf/public/include/"* "$INSTALL_PREFIX/include/AMF/"
 
 # 2. 下载 FFmpeg n9.0 源码
 log "下载 FFmpeg $FFMPEG_VER 源码..."
@@ -108,7 +111,13 @@ rm -f "$INSTALL_PREFIX/lib/"*.dll.a "$INSTALL_PREFIX/bin/"*.dll 2>/dev/null || t
 # 4. 打包归档 zip
 log "打包归档 SDK..."
 PKG_NAME="ffmpeg-n${FFMPEG_VER}-windows-amd64-full.zip"
-WIN_ZIP="$(cygpath -w "${DIST_DIR}/${PKG_NAME}" 2>/dev/null || echo "${DIST_DIR}/${PKG_NAME}")"
-WIN_SRC="$(cygpath -w "${INSTALL_PREFIX}" 2>/dev/null || echo "${INSTALL_PREFIX}")"
-powershell -NoProfile -Command "Compress-Archive -Path '${WIN_SRC}\\*' -DestinationPath '${WIN_ZIP}' -Force"
+if command -v zip >/dev/null 2>&1; then
+    (cd "$INSTALL_PREFIX" && zip -rq "${DIST_DIR}/${PKG_NAME}" *)
+elif command -v 7z >/dev/null 2>&1; then
+    7z a -tzip "${DIST_DIR}/${PKG_NAME}" "${INSTALL_PREFIX}/*" >/dev/null
+else
+    WIN_ZIP="$(cygpath -w "${DIST_DIR}/${PKG_NAME}" 2>/dev/null || echo "${DIST_DIR}/${PKG_NAME}")"
+    WIN_SRC="$(cygpath -w "${INSTALL_PREFIX}" 2>/dev/null || echo "${INSTALL_PREFIX}")"
+    powershell.exe -NoProfile -Command "Compress-Archive -Path '${WIN_SRC}\\*' -DestinationPath '${WIN_ZIP}' -Force"
+fi
 log "✓ 已生成归档: ${DIST_DIR}/${PKG_NAME}"

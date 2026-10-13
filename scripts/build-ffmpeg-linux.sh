@@ -8,13 +8,16 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 FFMPEG_VER="${FFMPEG_VER:-9.0}"
 NV_CODEC_VER="${NV_CODEC_VER:-n12.2.72.0}"
-AMF_TAG="${AMF_TAG:-v1.4.36}"
+AMF_TAG="${AMF_TAG:-v1.5.3}"
 DAV1D_VER="${DAV1D_VER:-1.5.1}"
 SVT_VER="${SVT_VER:-v4.0.1}"
 MPP_COMMIT="${MPP_COMMIT:-develop}"
 
 INSTALL_PREFIX="${1:-${INSTALL_PREFIX:-/opt/ffmpeg-n9}}"
 DIST_DIR="${2:-${DIST_DIR:-${ROOT_DIR}/dist}}"
+mkdir -p "$INSTALL_PREFIX" "$DIST_DIR"
+INSTALL_PREFIX="$(cd "$INSTALL_PREFIX" && pwd)"
+DIST_DIR="$(cd "$DIST_DIR" && pwd)"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -81,7 +84,7 @@ if [ "$ARCH" = "x86_64" ]; then
     mkdir -p "$WORK_DIR/amf"
     tar xzf "$WORK_DIR/amf.tgz" -C "$WORK_DIR/amf" --strip-components=1
     mkdir -p "$INSTALL_PREFIX/include/AMF"
-    cp -r "$WORK_DIR/amf/amf/public/include/." "$INSTALL_PREFIX/include/AMF/"
+    cp -rf "$WORK_DIR/amf/amf/public/include/"* "$INSTALL_PREFIX/include/AMF/"
 fi
 
 # 2. 自编静态依赖库 (dav1d + SVT-AV1)

@@ -19,7 +19,7 @@
 - **硬件编解码**：
   - NVIDIA NVENC / CUVID (`nv-codec-headers n12.2.72.0`)
   - Intel QSV / oneVPL (`libvpl`)
-  - AMD AMF (`v1.4.36`)
+  - AMD AMF (`v1.5.3`)
   - Windows 原生 MediaFoundation (`h264_mf` / `hevc_mf`) 与 D3D11VA / DXVA2
   - Rockchip MPP (`patches/ffmpeg9_rkmpp_enc_frame_lifetime.patch` 修复帧寿命周期)
 - **滤镜与协议**：
