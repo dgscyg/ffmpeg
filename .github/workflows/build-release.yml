@@ -1,0 +1,113 @@
+name: build-release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 编译并打包 FFmpeg (原生 ${{ matrix.arch }})
+        run: |
+          chmod +x scripts/build-ffmpeg-linux.sh
+          mkdir -p dist
+          bash scripts/build-ffmpeg-linux.sh /tmp/ffmpeg-prefix dist
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 设置 MSYS2 与 MinGW-w64 编译依赖
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-yasm
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-x264
+            mingw-w64-x86_64-x265
+            mingw-w64-x86_64-libvpx
+            mingw-w64-x86_64-opus
+            mingw-w64-x86_64-lame
+            mingw-w64-x86_64-aom
+            mingw-w64-x86_64-svt-av1
+            mingw-w64-x86_64-dav1d
+            mingw-w64-x86_64-amf-headers
+            mingw-w64-x86_64-freetype
+            mingw-w64-x86_64-harfbuzz
+            mingw-w64-x86_64-fribidi
+            mingw-w64-x86_64-libass
+            mingw-w64-x86_64-libunibreak
+
+      - name: 编译并打包 FFmpeg (Windows amd64)
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist
+          bash scripts/build-ffmpeg-windows.sh /c/tools/ffmpeg-n9 dist
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-windows-amd64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 下载所有产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'artifacts-*'
+          path: /tmp/release-artifacts
+          merge-multiple: true
+
+      - name: 列出发布文件
+        run: ls -la /tmp/release-artifacts/
+
+      - name: 发布 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: n9.0-full
+          name: "FFmpeg n9.0 Full-Featured Static SDK (x86_64 / arm64 / Win64)"
+          draft: false
+          prerelease: false
+          files: |
+            /tmp/release-artifacts/*.tar.gz
+            /tmp/release-artifacts/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

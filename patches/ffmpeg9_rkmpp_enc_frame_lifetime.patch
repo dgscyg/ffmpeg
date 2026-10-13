@@ -1,0 +1,63 @@
+diff --git a/libavcodec/rkmppenc.c b/libavcodec/rkmppenc.c
+index 09501f0..c63a17a 100644
+--- a/libavcodec/rkmppenc.c
++++ b/libavcodec/rkmppenc.c
+@@ -52,6 +52,7 @@ typedef struct RKMPPEncoderContext {
+     MppApi *mpi;
+     MppEncCfg cfg;
+     AVFrame *frame;
++    AVFrame *inflight_frame;
+ 
+     MppFrameFormat pix_fmt;
+     int mpp_stride;
+@@ -97,6 +98,7 @@ static av_cold int rkmpp_close_encoder(AVCodecContext *avctx)
+     }
+ 
+     av_frame_free(&ctx->frame);
++    av_frame_free(&ctx->inflight_frame);
+ 
+     return 0;
+ }
+@@ -109,6 +111,10 @@ static int rkmpp_create_frame_buf(AVCodecContext *avctx)
+     if (!ctx->frame)
+         return AVERROR(ENOMEM);
+ 
++    ctx->inflight_frame = av_frame_alloc();
++    if (!ctx->inflight_frame)
++        return AVERROR(ENOMEM);
++
+     if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME)
+         return 0;
+ 
+@@ -498,6 +504,7 @@ static int rkmpp_receive(AVCodecContext *avctx, AVPacket *pkt)
+         if (ret == MPP_OK && packet) {
+             ret = rkmpp_output_pkt(avctx, pkt, packet);
+             mpp_packet_deinit(&packet);
++            av_frame_unref(ctx->inflight_frame);
+             return ret;
+         }
+ 
+@@ -514,10 +521,12 @@ static int rkmpp_receive(AVCodecContext *avctx, AVPacket *pkt)
+         if (ret < 0)
+             return ret;
+ 
+-        if (!ctx->frame->buf[0])
++        if (!ctx->frame->buf[0]) {
+             ctx->eof_sent = true;
+-        else
+-            av_frame_unref(ctx->frame);
++        } else {
++            av_frame_unref(ctx->inflight_frame);
++            av_frame_move_ref(ctx->inflight_frame, ctx->frame);
++        }
+     }
+ }
+ 
+@@ -525,6 +534,7 @@ static av_cold void rkmpp_flush(AVCodecContext *avctx)
+ {
+     RKMPPEncoderContext *ctx = avctx->priv_data;
+     ctx->mpi->reset(ctx->enc);
++    av_frame_unref(ctx->inflight_frame);
+     ctx->eof_sent = true;
+ }
+ 
