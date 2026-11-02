@@ -88,7 +88,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1107 @@
+@@ -0,0 +1,1121 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 decoder.
 + *
@@ -126,7 +126,7 @@
 +
 +#define ASCEND_ALIGN_WIDTH   128
 +#define ASCEND_ALIGN_HEIGHT  2
-+#define ASCEND_QUEUE_DEPTH   8
++#define ASCEND_QUEUE_DEPTH   64
 +#define ASCEND_MAX_INFLIGHT  8
 +#define ASCEND_VDEC_BUF_FULL 507018
 +
@@ -181,6 +181,7 @@
 +    int queue_tail;
 +    int queue_count;
 +
++    int eof_reached;
 +    int eos_sent;
 +    int eos_done;
 +
@@ -589,7 +590,7 @@
 +        ascend_destroy_channel(ctx);
 +        queue_clear(ctx);
 +        atomic_store(&ctx->in_flight, 0);
-+        ctx->eos_sent = ctx->eos_done = 0;
++        ctx->eof_reached = ctx->eos_sent = ctx->eos_done = 0;
 +    }
 +    return ascend_create_channel(avctx, coded_w, coded_h);
 +}
@@ -783,27 +784,25 @@
 +        }
 +        pthread_mutex_unlock(&ctx->lock);
 +
-+        if (!ctx->eos_sent && atomic_load(&ctx->in_flight) < ASCEND_MAX_INFLIGHT) {
++        if (!ctx->eof_reached &&
++            atomic_load(&ctx->in_flight) < ASCEND_MAX_INFLIGHT) {
 +            AVPacket *pkt = av_packet_alloc();
 +            if (!pkt)
 +                return AVERROR(ENOMEM);
 +            ret = ff_decode_get_packet(avctx, pkt);
 +            if (ret == AVERROR_EOF) {
 +                av_packet_free(&pkt);
-+                ctx->eos_sent = 1;
-+                ret = ascend_send_eos(avctx);
-+                if (ret < 0)
-+                    return ret;
-+                continue;
++                /* Delay EOS until the pipeline is idle; see below. */
++                ctx->eof_reached = 1;
 +            }
 +            if (ret == AVERROR(EAGAIN)) {
 +                av_packet_free(&pkt);
 +                if (!atomic_load(&ctx->in_flight))
 +                    return AVERROR(EAGAIN);
-+            } else if (ret < 0) {
++            } else if (ret < 0 && ret != AVERROR_EOF) {
 +                av_packet_free(&pkt);
 +                return ret;
-+            } else {
++            } else if (ret >= 0) {
 +                ret = ascend_send_packet(avctx, pkt);
 +                av_packet_unref(pkt);
 +                av_packet_free(&pkt);
@@ -818,6 +817,20 @@
 +            ctx->eos_done = 1;
 +            pthread_mutex_unlock(&ctx->lock);
 +            return AVERROR_EOF;
++        }
++        /*
++         * aclvdecSendFrame(EOS) blocks until every queued callback has run,
++         * and nothing drains the frame queue while it blocks. Waiting for an
++         * idle pipeline here keeps all decoded frames available to the caller.
++         */
++        if (!ctx->eos_sent && ctx->eof_reached &&
++            !atomic_load(&ctx->in_flight) && !ctx->queue_count) {
++            pthread_mutex_unlock(&ctx->lock);
++            ctx->eos_sent = 1;
++            ret = ascend_send_eos(avctx);
++            if (ret < 0)
++                return ret;
++            continue;
 +        }
 +        if (!ctx->queue_count) {
 +            struct timespec ts;
@@ -911,7 +924,7 @@
 +    ascend_destroy_channel(ctx);
 +    queue_clear(ctx);
 +    atomic_store(&ctx->in_flight, 0);
-+    ctx->eos_sent = ctx->eos_done = 0;
++    ctx->eof_reached = ctx->eos_sent = ctx->eos_done = 0;
 +
 +    get_dimensions(avctx, &width, &height, &coded_w, &coded_h);
 +    if (coded_w > 0 && coded_h > 0 && !ctx->channel_desc)
@@ -1005,6 +1018,7 @@
 +
 +    ctx->codec_id = avctx->codec_id;
 +    ctx->queue_head = ctx->queue_tail = ctx->queue_count = 0;
++    ctx->eof_reached = ctx->eos_sent = ctx->eos_done = 0;
 +    atomic_init(&ctx->running, 0);
 +    atomic_init(&ctx->in_flight, 0);
 +    pthread_mutex_init(&ctx->lock, NULL);
