@@ -102,7 +102,7 @@ CFG_ARGS=(
     --enable-swresample --enable-swscale --enable-avfilter --enable-avformat
     --disable-doc --disable-ffplay
     --extra-cflags="-I$INSTALL_PREFIX/include"
-    --extra-ldflags="-L$INSTALL_PREFIX/lib -static-libgcc -static-libstdc++"
+    --extra-ldflags="-L$INSTALL_PREFIX/lib -Wl,--allow-multiple-definition"
 )
 
 log "运行 configure (Windows x86_64)..."
@@ -138,3 +138,4 @@ log "✓ 已生成归档: ${DIST_DIR}/${PKG_NAME}"
 # 复制独立 CLI 二进制到 dist 供 Release 直接下载
 cp -a "$INSTALL_PREFIX/bin/ffmpeg.exe" "${DIST_DIR}/ffmpeg.exe" 2>/dev/null || true
 cp -a "$INSTALL_PREFIX/bin/ffprobe.exe" "${DIST_DIR}/ffprobe.exe" 2>/dev/null || true
+(cd "$INSTALL_PREFIX/bin" && zip -rq "${DIST_DIR}/ffmpeg-n${FFMPEG_VER}-windows-amd64-bin.zip" *) 2>/dev/null || true
