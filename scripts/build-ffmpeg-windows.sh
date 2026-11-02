@@ -94,9 +94,9 @@ CFG_ARGS=(
     --enable-filter=transpose --enable-filter=vflip --enable-filter=hflip
     --enable-filter=subtitles --enable-filter=ass
     --enable-swresample --enable-swscale --enable-avfilter --enable-avformat
-    --disable-doc --disable-programs
+    --disable-doc --disable-ffplay
     --extra-cflags="-I$INSTALL_PREFIX/include"
-    --extra-ldflags="-L$INSTALL_PREFIX/lib"
+    --extra-ldflags="-L$INSTALL_PREFIX/lib -static-libgcc -static-libstdc++"
 )
 
 log "运行 configure (Windows x86_64)..."
@@ -104,12 +104,19 @@ cd "$WORK_DIR/ffmpeg"
 ./configure "${CFG_ARGS[@]}" || { tail -50 ffbuild/config.log 2>/dev/null || true; fail "FFmpeg configure 失败"; }
 
 log "编译 FFmpeg (make -j$JOBS)..."
+cd "$WORK_DIR/ffmpeg"
 make -j"$JOBS"
 make install
-rm -f "$INSTALL_PREFIX/lib/"*.dll.a "$INSTALL_PREFIX/bin/"*.dll 2>/dev/null || true
+rm -f "$INSTALL_PREFIX/lib/"*.dll.a 2>/dev/null || true
+strip -s "$INSTALL_PREFIX/bin/ffmpeg.exe" "$INSTALL_PREFIX/bin/ffprobe.exe" 2>/dev/null || true
+
+# 补充 MinGW 运行时依赖动态库至 bin/，确保普通 Windows 机器直接双击可用
+for dll in $(ldd "$INSTALL_PREFIX/bin/ffmpeg.exe" 2>/dev/null | grep -i "/mingw64/bin" | awk '{print $3}' || true); do
+    [ -f "$dll" ] && cp -a "$dll" "$INSTALL_PREFIX/bin/" 2>/dev/null || true
+done
 
 # 4. 打包归档 zip
-log "打包归档 SDK..."
+log "打包归档 SDK 与可执行程序..."
 PKG_NAME="ffmpeg-n${FFMPEG_VER}-windows-amd64-full.zip"
 if command -v zip >/dev/null 2>&1; then
     (cd "$INSTALL_PREFIX" && zip -rq "${DIST_DIR}/${PKG_NAME}" *)
@@ -121,3 +128,7 @@ else
     powershell.exe -NoProfile -Command "Compress-Archive -Path '${WIN_SRC}\\*' -DestinationPath '${WIN_ZIP}' -Force"
 fi
 log "✓ 已生成归档: ${DIST_DIR}/${PKG_NAME}"
+
+# 复制独立 CLI 二进制到 dist 供 Release 直接下载
+cp -a "$INSTALL_PREFIX/bin/ffmpeg.exe" "${DIST_DIR}/ffmpeg.exe" 2>/dev/null || true
+cp -a "$INSTALL_PREFIX/bin/ffprobe.exe" "${DIST_DIR}/ffprobe.exe" 2>/dev/null || true

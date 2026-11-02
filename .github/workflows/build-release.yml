@@ -102,11 +102,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: n9.0-full
-          name: "FFmpeg n9.0 Full-Featured Static SDK (x86_64 / arm64 / Win64)"
+          name: "FFmpeg n9.0 Full-Featured Static SDK & CLI (x86_64 / arm64 / Win64)"
           draft: false
           prerelease: false
           files: |
             /tmp/release-artifacts/*.tar.gz
             /tmp/release-artifacts/*.zip
+            /tmp/release-artifacts/ffmpeg*
+            /tmp/release-artifacts/ffprobe*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

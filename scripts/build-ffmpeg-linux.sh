@@ -200,7 +200,7 @@ CFG_ARGS=(
     --enable-filter=transpose --enable-filter=vflip --enable-filter=hflip
     --enable-filter=subtitles --enable-filter=ass
     --enable-swresample --enable-swscale --enable-avfilter --enable-avformat
-    --disable-doc --disable-programs
+    --disable-doc --disable-ffplay
     --enable-ascend
     --enable-decoder=h264_ascend --enable-decoder=hevc_ascend
     --extra-cflags="-fPIC -I$INSTALL_PREFIX/include -I$INSTALL_PREFIX/include/rga"
@@ -239,6 +239,7 @@ log "编译 FFmpeg (make -j$JOBS)..."
 make -j"$JOBS"
 make install
 rm -f "$INSTALL_PREFIX/lib/"libav*.so* "$INSTALL_PREFIX/lib/"libsw*.so*
+strip -s "$INSTALL_PREFIX/bin/ffmpeg" "$INSTALL_PREFIX/bin/ffprobe" 2>/dev/null || true
 
 # 拷贝 x86_64 下的 libvpl 依赖到 SDK 库目录，避免下游编译机因缺失 libvpl-dev 报错
 if [ "$ARCH" = "x86_64" ]; then
@@ -249,7 +250,11 @@ if [ "$ARCH" = "x86_64" ]; then
 fi
 
 # 6. 打包归档
-log "打包归档 SDK..."
+log "打包归档 SDK 与可执行程序..."
 PKG_NAME="ffmpeg-n${FFMPEG_VER}-linux-${PKG_ARCH}-full.tar.gz"
 tar -czf "${DIST_DIR}/${PKG_NAME}" -C "${INSTALL_PREFIX}" .
 log "✓ 已生成归档: ${DIST_DIR}/${PKG_NAME} ($(ls -lh "${DIST_DIR}/${PKG_NAME}" | awk '{print $5}'))"
+
+# 复制独立 CLI 二进制到 dist 供 Release 直接下载
+cp -a "$INSTALL_PREFIX/bin/ffmpeg" "${DIST_DIR}/ffmpeg-n${FFMPEG_VER}-linux-${PKG_ARCH}" 2>/dev/null || true
+cp -a "$INSTALL_PREFIX/bin/ffprobe" "${DIST_DIR}/ffprobe-n${FFMPEG_VER}-linux-${PKG_ARCH}" 2>/dev/null || true
