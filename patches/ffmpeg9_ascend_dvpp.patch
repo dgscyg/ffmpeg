@@ -815,11 +815,11 @@
 +
 +        pthread_mutex_lock(&ctx->lock);
 +        if (ctx->eos_sent && !atomic_load(&ctx->in_flight) && !ctx->queue_count) {
-+            pthread_mutex_unlock(&ctx->lock);
 +            ctx->eos_done = 1;
++            pthread_mutex_unlock(&ctx->lock);
 +            return AVERROR_EOF;
 +        }
-+        if (!ctx->queue_count && !ctx->eos_done) {
++        if (!ctx->queue_count) {
 +            struct timespec ts;
 +            clock_gettime(CLOCK_REALTIME, &ts);
 +            ts.tv_nsec += 100 * 1000000;
