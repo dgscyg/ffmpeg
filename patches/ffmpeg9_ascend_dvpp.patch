@@ -88,7 +88,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1105 @@
+@@ -0,0 +1,1107 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 decoder.
 + *
@@ -192,6 +192,7 @@
 +    aclError (*aclrtCreateContext)(aclrtContext *, int32_t);
 +    aclError (*aclrtDestroyContext)(aclrtContext);
 +    aclError (*aclrtSetCurrentContext)(aclrtContext);
++    aclError (*aclrtProcessReport)(int32_t);
 +    aclError (*aclrtMemcpy)(void *, size_t, const void *, size_t, aclrtMemcpyKind);
 +    aclError (*aclrtMemcpy2d)(void *, size_t, const void *, size_t,
 +                              size_t, size_t, aclrtMemcpyKind);
@@ -354,7 +355,7 @@
 +    pthread_mutex_unlock(&ctx->lock);
 +
 +    while (atomic_load(&ctx->running))
-+        aclrtProcessReport(100); /* VDEC invokes our callback on this thread */
++        ctx->aclrtProcessReport(100); /* VDEC invokes our callback here */
 +
 +    return NULL;
 +}
@@ -422,6 +423,7 @@
 +    LOAD_SYM(aclrtCreateContext, acl);
 +    LOAD_SYM(aclrtDestroyContext, acl);
 +    LOAD_SYM(aclrtSetCurrentContext, acl);
++    LOAD_SYM(aclrtProcessReport, acl);
 +    LOAD_SYM(aclrtMemcpy, acl);
 +    LOAD_OPT_SYM(aclrtMemcpy2d, acl);
 +

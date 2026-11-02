@@ -173,7 +173,10 @@ fi
 
 if [ -f "$ROOT_DIR/patches/ffmpeg9_ascend_dvpp.patch" ]; then
     log "应用补丁: ffmpeg9_ascend_dvpp.patch (华为昇腾 DVPP 硬解)"
-    patch -d "$WORK_DIR/ffmpeg" -p1 -N -r - < "$ROOT_DIR/patches/ffmpeg9_ascend_dvpp.patch" || true
+    # 该补丁现在承载真实 VDEC 调用链，应用失败必须让构建失败，
+    # 否则会退化成“没有 h264_ascend/hevc_ascend”的静默错误产物。
+    patch -d "$WORK_DIR/ffmpeg" -p1 -N -r - < "$ROOT_DIR/patches/ffmpeg9_ascend_dvpp.patch" \
+        || fail "昇腾 DVPP 补丁应用失败（FFmpeg 版本或基线变动？）"
 fi
 
 # 5. 配置与编译 FFmpeg
@@ -209,7 +212,7 @@ CFG_ARGS=(
     --disable-doc --disable-ffplay
     --enable-ascend
     --enable-decoder=h264_ascend --enable-decoder=hevc_ascend
-    --extra-cflags="-fPIC -I$INSTALL_PREFIX/include -I$INSTALL_PREFIX/include/rga"
+    --extra-cflags="-fPIC -DENABLE_DVPP_INTERFACE -I$INSTALL_PREFIX/include -I$INSTALL_PREFIX/include/rga"
     --extra-ldflags="-L$INSTALL_PREFIX/lib"
 )
 

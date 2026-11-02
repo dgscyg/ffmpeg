@@ -75,8 +75,6 @@ typedef struct aclvdecFrameConfig aclvdecFrameConfig;
 
 typedef void (*aclvdecCallback)(acldvppStreamDesc *input, acldvppPicDesc *output, void *userData);
 
-aclError aclrtProcessReport(int32_t timeout);
-
 #ifdef __cplusplus
 }
 #endif
