@@ -105,10 +105,9 @@ jobs:
           name: "FFmpeg n9.0 Full-Featured Static SDK & CLI (x86_64 / arm64 / Win64)"
           draft: false
           prerelease: false
-          files: |
-            /tmp/release-artifacts/*.tar.gz
-            /tmp/release-artifacts/*.zip
-            /tmp/release-artifacts/ffmpeg*
-            /tmp/release-artifacts/ffprobe*
+          # 注意：不要写重叠的 glob。之前 `*.tar.gz` 与 `ffmpeg*` 会同时
+          # 命中同一个文件，action 会先删除再重传，导致
+          # "Not Found - delete a release asset" 并让整个 job 失败。
+          files: /tmp/release-artifacts/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
