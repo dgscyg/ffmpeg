@@ -129,14 +129,29 @@ if [ "$ARCH" = "aarch64" ]; then
         -DBUILD_SHARED_LIBS=OFF -DBUILD_TEST=OFF >/dev/null
     ninja -C "$WORK_DIR/mpp/build" -j"$JOBS" install >/dev/null
 
-    log "编译 rockchip librga (aarch64 静态库)..."
+    log "安装 rockchip librga (aarch64 库与头文件)..."
     fetch_tarball "https://api.github.com/repos/airockchip/librga/tarball/$RGA_COMMIT" "$WORK_DIR/rga.tgz"
     mkdir -p "$WORK_DIR/rga"
     tar xzf "$WORK_DIR/rga.tgz" -C "$WORK_DIR/rga" --strip-components=1
-    cmake -S "$WORK_DIR/rga" -B "$WORK_DIR/rga/build" -G Ninja \
-        -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_SHARED_LIBS=OFF >/dev/null
-    ninja -C "$WORK_DIR/rga/build" -j"$JOBS" install >/dev/null
+    mkdir -p "$INSTALL_PREFIX/include/rga" "$INSTALL_PREFIX/lib/pkgconfig"
+    cp -rf "$WORK_DIR/rga/include/"* "$INSTALL_PREFIX/include/rga/"
+    cp -rf "$WORK_DIR/rga/include/"* "$INSTALL_PREFIX/include/"
+    if [ -d "$WORK_DIR/rga/libs/Linux/gcc-aarch64" ]; then
+        cp -af "$WORK_DIR/rga/libs/Linux/gcc-aarch64/"* "$INSTALL_PREFIX/lib/"
+    fi
+    cat << EOF > "$INSTALL_PREFIX/lib/pkgconfig/librga.pc"
+prefix=${INSTALL_PREFIX}
+exec_prefix=\${prefix}
+libdir=\${exec_prefix}/lib
+includedir=\${prefix}/include
+
+Name: librga
+Description: Userspace interface to Rockchip RGA 2D accelerator
+Version: 2.1.0
+Requires.private: libdrm
+Libs: -L\${libdir} -lrga
+Cflags: -I\${includedir} -I\${includedir}/rga
+EOF
 fi
 
 # 4. 下载 FFmpeg n9.0 源码并打补丁
