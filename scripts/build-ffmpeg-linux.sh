@@ -74,7 +74,7 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 
 fetch_tarball() {
     rm -f "$2"
-    curl -fsSL --retry 3 -H "User-Agent: $UA" -o "$2" "$1" || fail "下载失败: $1"
+    curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused -H "User-Agent: $UA" -o "$2" "$1" || fail "下载失败: $1"
     [ -s "$2" ] || fail "下载为空: $1"
 }
 
@@ -156,9 +156,15 @@ fi
 
 # 4. 下载 FFmpeg n9.0 源码并打补丁
 log "下载 FFmpeg $FFMPEG_VER 源码..."
-fetch_tarball "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VER.tar.xz" "$WORK_DIR/ffmpeg.tar.xz"
 mkdir -p "$WORK_DIR/ffmpeg"
-tar xJf "$WORK_DIR/ffmpeg.tar.xz" -C "$WORK_DIR/ffmpeg" --strip-components=1
+FFMPEG_URL="https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n${FFMPEG_VER}.tar.gz"
+if curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused -H "User-Agent: $UA" -o "$WORK_DIR/ffmpeg.tgz" "$FFMPEG_URL" && [ -s "$WORK_DIR/ffmpeg.tgz" ]; then
+    tar xzf "$WORK_DIR/ffmpeg.tgz" -C "$WORK_DIR/ffmpeg" --strip-components=1
+else
+    log "GitHub 归档拉取失败，回退至 ffmpeg.org..."
+    fetch_tarball "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VER.tar.xz" "$WORK_DIR/ffmpeg.tar.xz"
+    tar xJf "$WORK_DIR/ffmpeg.tar.xz" -C "$WORK_DIR/ffmpeg" --strip-components=1
+fi
 
 if [ -f "$ROOT_DIR/patches/ffmpeg9_rkmpp_enc_frame_lifetime.patch" ]; then
     log "应用补丁: ffmpeg9_rkmpp_enc_frame_lifetime.patch"
