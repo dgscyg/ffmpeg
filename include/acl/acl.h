@@ -33,6 +33,16 @@ typedef enum aclrtMemMallocPolicy {
     ACL_MEM_MALLOC_NORMAL_ONLY_P2P = 5
 } aclrtMemMallocPolicy;
 
+typedef enum aclrtMemcpyKind {
+    ACL_MEMCPY_HOST_TO_HOST = 0,
+    ACL_MEMCPY_HOST_TO_DEVICE = 1,
+    ACL_MEMCPY_DEVICE_TO_HOST = 2,
+    ACL_MEMCPY_DEVICE_TO_DEVICE = 3
+} aclrtMemcpyKind;
+
+typedef void *aclrtContext;
+typedef void *aclrtStream;
+
 typedef enum acldvppStreamFormat {
     H265_MAIN_LEVEL = 0,
     H264_BASELINE_LEVEL = 1,
@@ -61,8 +71,11 @@ typedef enum acldvppPixelFormat {
 typedef struct aclvdecChannelDesc aclvdecChannelDesc;
 typedef struct acldvppStreamDesc acldvppStreamDesc;
 typedef struct acldvppPicDesc acldvppPicDesc;
+typedef struct aclvdecFrameConfig aclvdecFrameConfig;
 
 typedef void (*aclvdecCallback)(acldvppStreamDesc *input, acldvppPicDesc *output, void *userData);
+
+aclError aclrtProcessReport(int32_t timeout);
 
 #ifdef __cplusplus
 }

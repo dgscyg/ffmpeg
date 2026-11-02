@@ -17,7 +17,7 @@
 - **软编码**：`libx264`、`libx265`、`libvpx` (VP8/VP9)、`libsvtav1` (AV1)、`libaom` (AV1)、`libopus`、`libmp3lame`、`aac`、`mjpeg`、`pcm_alaw`、`pcm_mulaw`
 - **软解码**：`h264`、`hevc`、`vp8`、`vp9`、`av1` (含 `libdav1d` 极速解码)、`mpeg4`、`mjpeg`、`aac`、`mp3`、`opus`、`pcm`
 - **硬件编解码与硬件图像加速**：
-  - **华为昇腾 Ascend**：`h264_ascend` / `hevc_ascend` (基于 AscendCL / DVPP 硬件加速，x86_64 与 aarch64 双架构原生支持)
+  - **华为昇腾 Ascend**：`h264_ascend` / `hevc_ascend` (基于 AscendCL / DVPP 硬件加速，x86_64 与 aarch64 双架构原生支持，详细实现规范见 [docs/ASCEND_DVPP_HANDOVER.md](docs/ASCEND_DVPP_HANDOVER.md))
   - **瑞芯微 Rockchip (RK3588/RK3568)**：`rkmpp` 硬件编解码 (`h264_rkmpp` / `hevc_rkmpp` / `vp8_rkmpp` / `vp9_rkmpp`) + `librga` 2D 硬件图形缩放/裁剪/旋转 + `libdrm` / `v4l2-m2m`
   - **NVIDIA**：NVENC / CUVID (`nv-codec-headers n12.2.72.0`)
   - **Intel**：QSV / oneVPL (`libvpl`)

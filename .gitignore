@@ -1,0 +1,3 @@
+# Local scratch space used while validating the Ascend patch.
+.tmp-build/
+.cache/
