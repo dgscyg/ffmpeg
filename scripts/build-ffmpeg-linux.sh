@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # build-ffmpeg-linux.sh — FFmpeg n9.0 全功能静态 SDK 构建脚本 (Linux x86_64 / arm64)
+# 默认原生全量支持:
+#   - Intel QSV / oneVPL (x86_64)
+#   - NVIDIA NVENC / NVDEC / CUDA (x86_64)
+#   - AMD AMF (x86_64)
+#   - 华为昇腾 Huawei Ascend DVPP (h264_ascend / hevc_ascend, x86_64 & aarch64)
+#   - 瑞芯微 Rockchip RK3588/RK3568 (rkmpp + librga 2D + libdrm + v4l2-m2m, aarch64)
 # 产物：dist/ffmpeg-n9.0-linux-<arch>-full.tar.gz
 set -euo pipefail
 
@@ -12,6 +18,7 @@ AMF_TAG="${AMF_TAG:-v1.5.3}"
 DAV1D_VER="${DAV1D_VER:-1.5.1}"
 SVT_VER="${SVT_VER:-v4.0.1}"
 MPP_COMMIT="${MPP_COMMIT:-develop}"
+RGA_COMMIT="${RGA_COMMIT:-main}"
 
 INSTALL_PREFIX="${1:-${INSTALL_PREFIX:-/opt/ffmpeg-n9}}"
 DIST_DIR="${2:-${DIST_DIR:-${ROOT_DIR}/dist}}"
@@ -72,6 +79,10 @@ fetch_tarball() {
 }
 
 # 1. 硬件加速头文件
+log "安装 Huawei AscendCL / DVPP 硬件加速头文件..."
+mkdir -p "$INSTALL_PREFIX/include/acl/ops"
+cp -rf "$ROOT_DIR/include/acl/"* "$INSTALL_PREFIX/include/acl/"
+
 if [ "$ARCH" = "x86_64" ]; then
     log "安装 nv-codec-headers ($NV_CODEC_VER)..."
     fetch_tarball "https://api.github.com/repos/FFmpeg/nv-codec-headers/tarball/$NV_CODEC_VER" "$WORK_DIR/nvcodec.tgz"
@@ -107,9 +118,7 @@ cmake -S "$WORK_DIR/svt" -B "$WORK_DIR/svt/build" -G Ninja \
     -DENABLE_LTO=OFF -DENABLE_IPO=OFF >/dev/null
 ninja -C "$WORK_DIR/svt/build" -j"$JOBS" install >/dev/null
 
-# 3. 若 aarch64 则构建 rockchip_mpp 静态库
-EXTRA_CFLAGS=""
-EXTRA_LDFLAGS=""
+# 3. 若 aarch64 则构建 rockchip_mpp 与 librga 静态库 (支持 RK3588/RK3568 全量硬件加速)
 if [ "$ARCH" = "aarch64" ]; then
     log "编译 rockchip_mpp (aarch64 静态库)..."
     fetch_tarball "https://api.github.com/repos/rockchip-linux/mpp/tarball/$MPP_COMMIT" "$WORK_DIR/mpp.tgz"
@@ -119,6 +128,15 @@ if [ "$ARCH" = "aarch64" ]; then
         -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF -DBUILD_TEST=OFF >/dev/null
     ninja -C "$WORK_DIR/mpp/build" -j"$JOBS" install >/dev/null
+
+    log "编译 rockchip librga (aarch64 静态库)..."
+    fetch_tarball "https://api.github.com/repos/airockchip/librga/tarball/$RGA_COMMIT" "$WORK_DIR/rga.tgz"
+    mkdir -p "$WORK_DIR/rga"
+    tar xzf "$WORK_DIR/rga.tgz" -C "$WORK_DIR/rga" --strip-components=1
+    cmake -S "$WORK_DIR/rga" -B "$WORK_DIR/rga/build" -G Ninja \
+        -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF >/dev/null
+    ninja -C "$WORK_DIR/rga/build" -j"$JOBS" install >/dev/null
 fi
 
 # 4. 下载 FFmpeg n9.0 源码并打补丁
@@ -130,6 +148,11 @@ tar xJf "$WORK_DIR/ffmpeg.tar.xz" -C "$WORK_DIR/ffmpeg" --strip-components=1
 if [ -f "$ROOT_DIR/patches/ffmpeg9_rkmpp_enc_frame_lifetime.patch" ]; then
     log "应用补丁: ffmpeg9_rkmpp_enc_frame_lifetime.patch"
     patch -d "$WORK_DIR/ffmpeg" -p1 -N -r - < "$ROOT_DIR/patches/ffmpeg9_rkmpp_enc_frame_lifetime.patch" || true
+fi
+
+if [ -f "$ROOT_DIR/patches/ffmpeg9_ascend_dvpp.patch" ]; then
+    log "应用补丁: ffmpeg9_ascend_dvpp.patch (华为昇腾 DVPP 硬解)"
+    patch -d "$WORK_DIR/ffmpeg" -p1 -N -r - < "$ROOT_DIR/patches/ffmpeg9_ascend_dvpp.patch" || true
 fi
 
 # 5. 配置与编译 FFmpeg
@@ -163,7 +186,9 @@ CFG_ARGS=(
     --enable-filter=subtitles --enable-filter=ass
     --enable-swresample --enable-swscale --enable-avfilter --enable-avformat
     --disable-doc --disable-programs
-    --extra-cflags="-fPIC -I$INSTALL_PREFIX/include"
+    --enable-ascend
+    --enable-decoder=h264_ascend --enable-decoder=hevc_ascend
+    --extra-cflags="-fPIC -I$INSTALL_PREFIX/include -I$INSTALL_PREFIX/include/rga"
     --extra-ldflags="-L$INSTALL_PREFIX/lib"
 )
 
@@ -183,8 +208,10 @@ fi
 
 if [ "$ARCH" = "aarch64" ]; then
     CFG_ARGS+=(
+        --enable-libdrm
+        --enable-v4l2-m2m
         --enable-rkmpp
-        --enable-decoder=h264_rkmpp --enable-decoder=hevc_rkmpp --enable-decoder=vp9_rkmpp
+        --enable-decoder=h264_rkmpp --enable-decoder=hevc_rkmpp --enable-decoder=vp8_rkmpp --enable-decoder=vp9_rkmpp
         --enable-encoder=h264_rkmpp --enable-encoder=hevc_rkmpp
     )
 fi

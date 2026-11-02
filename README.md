@@ -1,6 +1,6 @@
 # FFmpeg n9.0 Full-Featured Static SDK
 
-全功能 FFmpeg `n9.0` 跨平台静态库构建工程（支持 Linux x86_64、Linux aarch64 与 Windows x86_64）。包含硬件加速编解码、全套开源软编软解、字幕与文字滤镜，以及瑞芯微 RKMPP 厂商寿命周期补丁。
+全功能 FFmpeg `n9.0` 跨平台静态库构建工程（支持 Linux x86_64、Linux aarch64 与 Windows x86_64）。包含全套硬件加速编解码（Intel QSV / NVIDIA NVENC / AMD AMF / 华为昇腾 Ascend DVPP / 瑞芯微 RK3588 MPP + RGA）、开源软编软解、字幕与文字滤镜，以及瑞芯微 RKMPP 厂商寿命周期补丁。
 
 专为 `mediaCenter`、`gb`、`ZLMediaKit` 等流媒体及 CGO 项目提供零冗余、开箱即用的静态 SDK。
 
@@ -8,20 +8,21 @@
 
 | 平台 | 架构 | 文件名 | 说明 |
 | :--- | :--- | :--- | :--- |
-| **Linux** | `amd64` (x86_64) | `ffmpeg-n9.0-linux-amd64-full.tar.gz` | NVENC / QSV / AMF / VAAPI / x264 / x265 / AV1 / SVT-AV1 / dav1d |
-| **Linux** | `arm64` (aarch64) | `ffmpeg-n9.0-linux-arm64-full.tar.gz` | Rockchip MPP 硬件编解码 (带补丁) / x264 / x265 / SVT-AV1 / dav1d |
+| **Linux** | `amd64` (x86_64) | `ffmpeg-n9.0-linux-amd64-full.tar.gz` | NVENC / QSV / AMF / 华为昇腾 Ascend DVPP / VAAPI / x264 / x265 / AV1 / SVT-AV1 / dav1d |
+| **Linux** | `arm64` (aarch64) | `ffmpeg-n9.0-linux-arm64-full.tar.gz` | 瑞芯微 RK3588 MPP + RGA 2D / 华为昇腾 Ascend DVPP / x264 / x265 / SVT-AV1 / dav1d |
 | **Windows** | `amd64` (x86_64) | `ffmpeg-n9.0-windows-amd64-full.zip` | NVENC / QSV / AMF / MediaFoundation / D3D11VA / DXVA2 / SChannel |
 
 ## 包含能力清单
 
 - **软编码**：`libx264`、`libx265`、`libvpx` (VP8/VP9)、`libsvtav1` (AV1)、`libaom` (AV1)、`libopus`、`libmp3lame`、`aac`、`mjpeg`、`pcm_alaw`、`pcm_mulaw`
 - **软解码**：`h264`、`hevc`、`vp8`、`vp9`、`av1` (含 `libdav1d` 极速解码)、`mpeg4`、`mjpeg`、`aac`、`mp3`、`opus`、`pcm`
-- **硬件编解码**：
-  - NVIDIA NVENC / CUVID (`nv-codec-headers n12.2.72.0`)
-  - Intel QSV / oneVPL (`libvpl`)
-  - AMD AMF (`v1.5.3`)
-  - Windows 原生 MediaFoundation (`h264_mf` / `hevc_mf`) 与 D3D11VA / DXVA2
-  - Rockchip MPP (`patches/ffmpeg9_rkmpp_enc_frame_lifetime.patch` 修复帧寿命周期)
+- **硬件编解码与硬件图像加速**：
+  - **华为昇腾 Ascend**：`h264_ascend` / `hevc_ascend` (基于 AscendCL / DVPP 硬件加速，x86_64 与 aarch64 双架构原生支持)
+  - **瑞芯微 Rockchip (RK3588/RK3568)**：`rkmpp` 硬件编解码 (`h264_rkmpp` / `hevc_rkmpp` / `vp8_rkmpp` / `vp9_rkmpp`) + `librga` 2D 硬件图形缩放/裁剪/旋转 + `libdrm` / `v4l2-m2m`
+  - **NVIDIA**：NVENC / CUVID (`nv-codec-headers n12.2.72.0`)
+  - **Intel**：QSV / oneVPL (`libvpl`)
+  - **AMD**：AMF (`v1.5.3`)
+  - **Windows 原生**：MediaFoundation (`h264_mf` / `hevc_mf`) 与 D3D11VA / DXVA2
 - **滤镜与协议**：
   - `scale` / `format` / `fps` / `overlay` / `crop` / `pad` / `transpose`
   - `drawtext` (freetype2 + harfbuzz) / `subtitles` + `ass` (`libass` + `libunibreak` + `fribidi`)
