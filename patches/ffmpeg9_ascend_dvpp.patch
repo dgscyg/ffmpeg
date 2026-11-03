@@ -102,7 +102,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1605 @@
+@@ -0,0 +1,1603 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 hardware decoder.
 + *
@@ -1536,13 +1536,11 @@
 +    avctx->sw_pix_fmt = AV_PIX_FMT_NV12;
 +    if (ctx->device_output) {
 +        avctx->pix_fmt = AV_PIX_FMT_ASCEND;
-+    } else if (avctx->hw_frames_ctx || avctx->hw_device_ctx) {
++    } else {
 +        ret = ff_get_format(avctx, pix_fmts_hw);
 +        if (ret < 0)
 +            return ret;
 +        avctx->pix_fmt = ret;
-+    } else {
-+        avctx->pix_fmt = AV_PIX_FMT_NV12;
 +    }
 +
 +    if (avctx->pix_fmt == AV_PIX_FMT_ASCEND) {
@@ -1710,7 +1708,7 @@
 +};
 --- /dev/null
 +++ b/libavcodec/ascendenc.c
-@@ -0,0 +1,864 @@
+@@ -0,0 +1,913 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 hardware encoder (h264_ascend / hevc_ascend).
 + *
@@ -1787,6 +1785,7 @@
 +
 +    int device_id;
 +    int rc_mode;
++    int frame_rate;
 +    int initialized;
 +    int acl_acquired;
 +
@@ -1807,6 +1806,9 @@
 +    int queue_head;
 +    int queue_tail;
 +    int queue_count;
++
++    acldvppPicDesc *pic_desc_pool[ASCEND_ENC_QUEUE_SZ];
++    int pic_desc_count;
 +
 +    int eof_sent;
 +    int eos_done;
@@ -1932,6 +1934,44 @@
 +    pthread_mutex_unlock(&ctx->lock);
 +}
 +
++static acldvppPicDesc *enc_pic_desc_get(AscendEncodeContext *ctx)
++{
++    pthread_mutex_lock(&ctx->lock);
++    if (ctx->pic_desc_count > 0) {
++        acldvppPicDesc *p = ctx->pic_desc_pool[--ctx->pic_desc_count];
++        pthread_mutex_unlock(&ctx->lock);
++        return p;
++    }
++    pthread_mutex_unlock(&ctx->lock);
++    return ctx->acldvppCreatePicDesc ? ctx->acldvppCreatePicDesc() : NULL;
++}
++
++static void enc_pic_desc_put(AscendEncodeContext *ctx, acldvppPicDesc *p)
++{
++    if (!p)
++        return;
++    pthread_mutex_lock(&ctx->lock);
++    if (ctx->pic_desc_count < ASCEND_ENC_QUEUE_SZ) {
++        ctx->pic_desc_pool[ctx->pic_desc_count++] = p;
++        pthread_mutex_unlock(&ctx->lock);
++        return;
++    }
++    pthread_mutex_unlock(&ctx->lock);
++    if (ctx->acldvppDestroyPicDesc)
++        ctx->acldvppDestroyPicDesc(p);
++}
++
++static void enc_pic_desc_pool_clear(AscendEncodeContext *ctx)
++{
++    pthread_mutex_lock(&ctx->lock);
++    while (ctx->pic_desc_count > 0) {
++        acldvppPicDesc *p = ctx->pic_desc_pool[--ctx->pic_desc_count];
++        if (p && ctx->acldvppDestroyPicDesc)
++            ctx->acldvppDestroyPicDesc(p);
++    }
++    pthread_mutex_unlock(&ctx->lock);
++}
++
 +static void *ascend_enc_cb_thread(void *arg)
 +{
 +    AscendEncodeContext *ctx = arg;
@@ -1958,7 +1998,7 @@
 +    AscendEncodeContext *ctx = meta ? meta->ctx : NULL;
 +
 +    if (input && ctx)
-+        ctx->acldvppDestroyPicDesc(input);
++        enc_pic_desc_put(ctx, input);
 +
 +    if (meta && ctx) {
 +        if (meta->in_dev)
@@ -2148,10 +2188,13 @@
 +
 +    en_type = (avctx->codec_id == AV_CODEC_ID_HEVC) ? H265_MAIN_LEVEL : H264_HIGH_LEVEL;
 +    gop = avctx->gop_size > 0 ? (uint32_t)avctx->gop_size : 30;
-+    fps = (avctx->framerate.num > 0 && avctx->framerate.den > 0)
-+          ? (uint32_t)(avctx->framerate.num / avctx->framerate.den) : 25;
++    fps = ctx->frame_rate > 0 ? (uint32_t)ctx->frame_rate :
++          ((avctx->framerate.num > 0 && avctx->framerate.den > 0)
++          ? (uint32_t)(avctx->framerate.num / avctx->framerate.den) : 30);
 +    if (fps < 1)
-+        fps = 25;
++        fps = 30;
++    if (ctx->rc_mode != 1 && fps < 30)
++        fps = 30;
 +
 +    max_bitrate = avctx->bit_rate > 0
 +                  ? (uint32_t)(avctx->bit_rate / 1000)
@@ -2189,8 +2232,9 @@
 +
 +    ctx->initialized = 1;
 +    av_log(avctx, AV_LOG_INFO,
-+           "[AscendEnc] DVPP VENC ready (device=%d, %dx%d, gop=%u, fps=%u, max_bitrate=%ukbps)\n",
-+           ctx->device_id, avctx->width, avctx->height, gop, fps, max_bitrate);
++           "[AscendEnc] DVPP VENC ready (device=%d, %dx%d, rc=%s, gop=%u, fps=%u, max_bitrate=%ukbps)\n",
++           ctx->device_id, avctx->width, avctx->height,
++           (ctx->rc_mode == 1 ? "VBR" : "CBR"), gop, fps, max_bitrate);
 +    return 0;
 +}
 +
@@ -2293,7 +2337,7 @@
 +        return AVERROR(EINVAL);
 +    }
 +
-+    pic = ctx->acldvppCreatePicDesc();
++    pic = enc_pic_desc_get(ctx);
 +    if (!pic) {
 +        if (in_dev)
 +            enc_in_pool_put(ctx, in_dev);
@@ -2310,7 +2354,7 @@
 +
 +    meta = av_mallocz(sizeof(*meta));
 +    if (!meta) {
-+        ctx->acldvppDestroyPicDesc(pic);
++        enc_pic_desc_put(ctx, pic);
 +        if (in_dev)
 +            enc_in_pool_put(ctx, in_dev);
 +        av_frame_free(&hw_ref);
@@ -2331,7 +2375,7 @@
 +    if (ctx->aclvencSendFrame(ctx->channel_desc, pic, NULL,
 +                              ctx->frame_cfg, meta) != ACL_SUCCESS) {
 +        atomic_fetch_sub(&ctx->in_flight, 1);
-+        ctx->acldvppDestroyPicDesc(pic);
++        enc_pic_desc_put(ctx, pic);
 +        if (in_dev)
 +            enc_in_pool_put(ctx, in_dev);
 +        av_frame_free(&hw_ref);
@@ -2463,6 +2507,7 @@
 +    }
 +    enc_queue_clear(ctx);
 +    enc_in_pool_clear(ctx);
++    enc_pic_desc_pool_clear(ctx);
 +    if (ctx->host_stage_buf && ctx->aclrtFreeHost)
 +        ctx->aclrtFreeHost(ctx->host_stage_buf);
 +    ctx->host_stage_buf = NULL;
@@ -2486,6 +2531,7 @@
 +    const AVClass *class;
 +    int device_id;
 +    int rc_mode;
++    int frame_rate;
 +} AscendEncodeContext;
 +
 +static av_cold int ascend_encode_init(AVCodecContext *avctx)
@@ -2504,8 +2550,9 @@
 +#define VE (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM)
 +
 +static const AVOption ascend_enc_options[] = {
-+    { "device_id", "Ascend NPU device ID", OFFSET(device_id), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 63, VE },
-+    { "rc_mode",   "Rate control mode (1=VBR, 2=CBR)", OFFSET(rc_mode), AV_OPT_TYPE_INT, { .i64 = 2 }, 0, 2, VE },
++    { "device_id",  "Ascend NPU device ID", OFFSET(device_id), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 63, VE },
++    { "rc_mode",    "Rate control mode (1=VBR, 0/2=CBR)", OFFSET(rc_mode), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 2, VE },
++    { "frame_rate", "Source frame rate for rate control (0=auto)", OFFSET(frame_rate), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 240, VE },
 +    { NULL }
 +};
 +
@@ -3050,7 +3097,7 @@
  /**
 --- /dev/null
 +++ b/libavutil/hwcontext_ascend.c
-@@ -0,0 +1,558 @@
+@@ -0,0 +1,589 @@
 +/*
 + * Huawei Ascend DVPP hardware context implementation.
 + *
@@ -3191,10 +3238,32 @@
 +    return 0;
 +}
 +
++static void ascend_atexit_cleanup(void)
++{
++    pthread_mutex_lock(&ascend_global_lock);
++    for (int i = 0; i < (int)FF_ARRAY_ELEMS(ascend_device_refs); i++) {
++        if (ascend_device_contexts[i] && ascend_syms.aclrtDestroyContext) {
++            ascend_syms.aclrtDestroyContext(ascend_device_contexts[i]);
++            ascend_device_contexts[i] = NULL;
++        }
++        if (ascend_device_refs[i] > 0 && ascend_syms.aclrtResetDevice) {
++            ascend_syms.aclrtResetDevice(i);
++            ascend_device_refs[i] = 0;
++        }
++    }
++    if (ascend_acl_refs > 0) {
++        ascend_acl_refs = 0;
++        if (ascend_syms.aclFinalize)
++            ascend_syms.aclFinalize();
++    }
++    pthread_mutex_unlock(&ascend_global_lock);
++}
++
 +int av_ascend_global_acquire(int device_id, void **out_acl_lib,
 +                             void **out_dvpp_lib, void **out_context,
 +                             void *log_ctx)
 +{
++    static int atexit_registered = 0;
 +    aclrtContext ctx = NULL;
 +    aclError ret;
 +    int err;
@@ -3207,6 +3276,11 @@
 +    if (err < 0) {
 +        pthread_mutex_unlock(&ascend_global_lock);
 +        return err;
++    }
++
++    if (!atexit_registered) {
++        atexit(ascend_atexit_cleanup);
++        atexit_registered = 1;
 +    }
 +
 +    if (!ascend_acl_refs) {
@@ -3268,9 +3342,13 @@
 +                ascend_syms.aclrtResetDevice(device_id);
 +        }
 +    }
-+    if (ascend_acl_refs > 0)
++    if (ascend_acl_refs > 0) {
 +        ascend_acl_refs--;
-+    /* Keep aclInit active across process lifetime for multi-stream safety */
++        if (!ascend_acl_refs) {
++            if (ascend_syms.aclFinalize)
++                ascend_syms.aclFinalize();
++        }
++    }
 +    pthread_mutex_unlock(&ascend_global_lock);
 +}
 +
