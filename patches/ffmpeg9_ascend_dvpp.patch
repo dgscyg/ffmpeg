@@ -148,7 +148,7 @@
 +#include <acl/ops/acl_dvpp.h>
 +
 +#define ASCEND_ALIGN_WIDTH   128
-+#define ASCEND_ALIGN_HEIGHT  2
++#define ASCEND_ALIGN_HEIGHT  16
 +#define ASCEND_QUEUE_DEPTH   64
 +#define ASCEND_MAX_INFLIGHT  32
 +#define ASCEND_OUT_POOL_SIZE (ASCEND_MAX_INFLIGHT + ASCEND_QUEUE_DEPTH + 16)
@@ -1274,11 +1274,11 @@
 +            return AVERROR_EOF;
 +        }
 +        if (!ctx->eof_reached) {
-+            if (sent_pkt && !poll_waited && atomic_load(&ctx->in_flight) >= 8) {
++            if (sent_pkt && !poll_waited && atomic_load(&ctx->in_flight) > 0) {
 +                struct timespec ts;
 +                poll_waited = 1;
 +                clock_gettime(CLOCK_REALTIME, &ts);
-+                ts.tv_nsec += 5 * 1000000;
++                ts.tv_nsec += 20 * 1000000;
 +                if (ts.tv_nsec >= 1000000000) {
 +                    ts.tv_sec++;
 +                    ts.tv_nsec -= 1000000000;
@@ -1750,7 +1750,7 @@
 +#include <acl/ops/acl_dvpp.h>
 +
 +#define ASCEND_ENC_ALIGN_W    16
-+#define ASCEND_ENC_ALIGN_H    2
++#define ASCEND_ENC_ALIGN_H    16
 +#define ASCEND_ENC_QUEUE_SZ   64
 +#define ASCEND_ENC_POOL_SZ    36
 +
@@ -2170,8 +2170,8 @@
 +    ret |= ctx->aclvencSetChannelDescCallback(ctx->channel_desc, ascend_venc_callback);
 +    ret |= ctx->aclvencSetChannelDescEnType(ctx->channel_desc, en_type);
 +    ret |= ctx->aclvencSetChannelDescPicFormat(ctx->channel_desc, PIXEL_FORMAT_YUV_SEMIPLANAR_420);
-+    ret |= ctx->aclvencSetChannelDescPicWidth(ctx->channel_desc, FFALIGN(avctx->width, 2));
-+    ret |= ctx->aclvencSetChannelDescPicHeight(ctx->channel_desc, FFALIGN(avctx->height, 2));
++    ret |= ctx->aclvencSetChannelDescPicWidth(ctx->channel_desc, FFALIGN(avctx->width, 16));
++    ret |= ctx->aclvencSetChannelDescPicHeight(ctx->channel_desc, FFALIGN(avctx->height, 16));
 +    ret |= ctx->aclvencSetChannelDescKeyFrameInterval(ctx->channel_desc, gop);
 +    if (ctx->aclvencSetChannelDescRcMode)
 +        ctx->aclvencSetChannelDescRcMode(ctx->channel_desc, (uint32_t)ctx->rc_mode);
@@ -2221,10 +2221,10 @@
 +                          ? (uint32_t)((frame->data[1] - frame->data[0]) / src_sw)
 +                          : stride_h;
 +        /*
-+         * Accept any upstream stride matching CANN 16-width and 2-height alignment.
++         * Accept any upstream stride matching CANN 16-width and 16-height alignment.
 +         * Decoder / VPC output 128-aligned frames are zero-copy passed through directly.
 +         */
-+        if (src_sw >= w && (src_sw % 16) == 0 && src_sh >= h && (src_sh % 2) == 0) {
++        if (src_sw >= w && (src_sw % 16) == 0 && src_sh >= h && (src_sh % 16) == 0) {
 +            hw_ref = av_frame_clone(frame);
 +            if (!hw_ref)
 +                return AVERROR(ENOMEM);
@@ -2411,7 +2411,7 @@
 +            if (atomic_load(&ctx->in_flight) > 0) {
 +                struct timespec ts;
 +                clock_gettime(CLOCK_REALTIME, &ts);
-+                ts.tv_nsec += 5 * 1000000;
++                ts.tv_nsec += 20 * 1000000;
 +                if (ts.tv_nsec >= 1000000000) {
 +                    ts.tv_sec++;
 +                    ts.tv_nsec -= 1000000000;
@@ -3633,7 +3633,7 @@
 +#include "hwcontext.h"
 +
 +#define ASCEND_ALIGN_W 128
-+#define ASCEND_ALIGN_H 2
++#define ASCEND_ALIGN_H 16
 +
 +/**
 + * Ascend device context allocated as AVHWDeviceContext.hwctx.
