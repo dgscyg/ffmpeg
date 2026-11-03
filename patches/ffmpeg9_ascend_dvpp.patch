@@ -88,7 +88,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1121 @@
+@@ -0,0 +1,1143 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 decoder.
 + *
@@ -784,25 +784,27 @@
 +        }
 +        pthread_mutex_unlock(&ctx->lock);
 +
++        /*
++         * CANN VDEC buffers several frames before it emits the first one, so
++         * the decoder must keep receiving packets. Returning EAGAIN lets
++         * FFmpeg feed the next packet; blocking here instead deadlocks the
++         * whole pipeline with only a couple of packets in flight.
++         */
 +        if (!ctx->eof_reached &&
 +            atomic_load(&ctx->in_flight) < ASCEND_MAX_INFLIGHT) {
 +            AVPacket *pkt = av_packet_alloc();
 +            if (!pkt)
 +                return AVERROR(ENOMEM);
 +            ret = ff_decode_get_packet(avctx, pkt);
-+            if (ret == AVERROR_EOF) {
++            if (ret < 0) {
 +                av_packet_free(&pkt);
-+                /* Delay EOS until the pipeline is idle; see below. */
-+                ctx->eof_reached = 1;
-+            }
-+            if (ret == AVERROR(EAGAIN)) {
-+                av_packet_free(&pkt);
-+                if (!atomic_load(&ctx->in_flight))
-+                    return AVERROR(EAGAIN);
-+            } else if (ret < 0 && ret != AVERROR_EOF) {
-+                av_packet_free(&pkt);
-+                return ret;
-+            } else if (ret >= 0) {
++                if (ret == AVERROR_EOF) {
++                    ctx->eof_reached = 1;
++                } else {
++                    /* Includes EAGAIN: let the caller supply more input. */
++                    return ret;
++                }
++            } else {
 +                ret = ascend_send_packet(avctx, pkt);
 +                av_packet_unref(pkt);
 +                av_packet_free(&pkt);
@@ -812,18 +814,33 @@
 +            }
 +        }
 +
-+        pthread_mutex_lock(&ctx->lock);
-+        if (ctx->eos_sent && !atomic_load(&ctx->in_flight) && !ctx->queue_count) {
-+            ctx->eos_done = 1;
++        if (!ctx->eof_reached) {
++            /* Bounded wait: never spin the CPU while VDEC works. */
++            struct timespec ts;
++            int have;
++            pthread_mutex_lock(&ctx->lock);
++            if (!ctx->queue_count) {
++                clock_gettime(CLOCK_REALTIME, &ts);
++                ts.tv_nsec += 10 * 1000000;
++                if (ts.tv_nsec >= 1000000000) {
++                    ts.tv_sec++;
++                    ts.tv_nsec -= 1000000000;
++                }
++                pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
++            }
++            have = ctx->queue_count > 0;
 +            pthread_mutex_unlock(&ctx->lock);
-+            return AVERROR_EOF;
++            if (!have)
++                return AVERROR(EAGAIN);
++            continue;
 +        }
++
 +        /*
-+         * aclvdecSendFrame(EOS) blocks until every queued callback has run,
-+         * and nothing drains the frame queue while it blocks. Waiting for an
-+         * idle pipeline here keeps all decoded frames available to the caller.
++         * EOF: drain. aclvdecSendFrame(EOS) blocks until every callback has
++         * run, so it is only sent once the pipeline is completely idle.
 +         */
-+        if (!ctx->eos_sent && ctx->eof_reached &&
++        pthread_mutex_lock(&ctx->lock);
++        if (!ctx->eos_sent &&
 +            !atomic_load(&ctx->in_flight) && !ctx->queue_count) {
 +            pthread_mutex_unlock(&ctx->lock);
 +            ctx->eos_sent = 1;
@@ -832,7 +849,12 @@
 +                return ret;
 +            continue;
 +        }
-+        if (!ctx->queue_count) {
++        if (ctx->eos_sent && !atomic_load(&ctx->in_flight) && !ctx->queue_count) {
++            ctx->eos_done = 1;
++            pthread_mutex_unlock(&ctx->lock);
++            return AVERROR_EOF;
++        }
++        {
 +            struct timespec ts;
 +            clock_gettime(CLOCK_REALTIME, &ts);
 +            ts.tv_nsec += 100 * 1000000;
@@ -845,9 +867,9 @@
 +        pthread_mutex_unlock(&ctx->lock);
 +
 +        waited_ms += 100;
-+        if (waited_ms >= 60000) {
++        if (waited_ms >= 30000) {
 +            av_log(avctx, AV_LOG_ERROR,
-+                   "[Ascend] timeout waiting for VDEC callback (in_flight=%d)\n",
++                   "[Ascend] timeout draining VDEC (in_flight=%d)\n",
 +                   atomic_load(&ctx->in_flight));
 +            return AVERROR_EXTERNAL;
 +        }
