@@ -69,11 +69,17 @@ typedef enum acldvppPixelFormat {
 } acldvppPixelFormat;
 
 typedef struct aclvdecChannelDesc aclvdecChannelDesc;
+typedef struct aclvencChannelDesc aclvencChannelDesc;
+typedef struct acldvppChannelDesc acldvppChannelDesc;
 typedef struct acldvppStreamDesc acldvppStreamDesc;
 typedef struct acldvppPicDesc acldvppPicDesc;
 typedef struct aclvdecFrameConfig aclvdecFrameConfig;
+typedef struct aclvencFrameConfig aclvencFrameConfig;
+typedef struct acldvppRoiConfig acldvppRoiConfig;
+typedef struct acldvppResizeConfig acldvppResizeConfig;
 
 typedef void (*aclvdecCallback)(acldvppStreamDesc *input, acldvppPicDesc *output, void *userData);
+typedef void (*aclvencCallback)(acldvppPicDesc *input, acldvppStreamDesc *output, void *userdata);
 
 #ifdef __cplusplus
 }

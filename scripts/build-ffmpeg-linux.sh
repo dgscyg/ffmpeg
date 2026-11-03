@@ -212,6 +212,8 @@ CFG_ARGS=(
     --disable-doc --disable-ffplay
     --enable-ascend
     --enable-decoder=h264_ascend --enable-decoder=hevc_ascend
+    --enable-encoder=h264_ascend --enable-encoder=hevc_ascend
+    --enable-filter=scale_ascend --enable-filter=hwupload --enable-filter=hwdownload
     --extra-cflags="-fPIC -DENABLE_DVPP_INTERFACE -I$INSTALL_PREFIX/include -I$INSTALL_PREFIX/include/rga"
     --extra-ldflags="-L$INSTALL_PREFIX/lib"
 )
