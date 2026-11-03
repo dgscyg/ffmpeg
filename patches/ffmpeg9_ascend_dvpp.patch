@@ -102,7 +102,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1611 @@
+@@ -0,0 +1,1471 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 hardware decoder.
 + *
@@ -148,12 +148,11 @@
 +#include <acl/ops/acl_dvpp.h>
 +
 +#define ASCEND_ALIGN_WIDTH   128
-+#define ASCEND_ALIGN_HEIGHT  16
++#define ASCEND_ALIGN_HEIGHT  2
 +#define ASCEND_QUEUE_DEPTH   64
 +#define ASCEND_MAX_INFLIGHT  32
 +#define ASCEND_OUT_POOL_SIZE (ASCEND_MAX_INFLIGHT + ASCEND_QUEUE_DEPTH + 16)
 +#define ASCEND_IN_POOL_SIZE  (ASCEND_MAX_INFLIGHT + 8)
-+#define ASCEND_DESC_POOL_SZ  (ASCEND_MAX_INFLIGHT + ASCEND_QUEUE_DEPTH + 8)
 +#define ASCEND_IN_MIN_ALLOC  (256 * 1024)
 +#define ASCEND_VDEC_BUF_FULL 507018
 +
@@ -202,7 +201,6 @@
 +    size_t in_cap;
 +    int64_t pts;
 +    int64_t dts;
-+    int is_eos;
 +} AscendFrameMeta;
 +
 +typedef struct AscendFrame {
@@ -256,19 +254,10 @@
 +    AVBufferPool *host_frame_pool;
 +    size_t host_frame_size;
 +
-+    void *host_pkt_buf;
-+    size_t host_pkt_cap;
-+
 +    AscendOutPool *out_pool;
 +
 +    AscendInBuf in_pool[ASCEND_IN_POOL_SIZE];
 +    int in_pool_count;
-+
-+    acldvppStreamDesc *stream_desc_pool[ASCEND_DESC_POOL_SZ];
-+    int stream_desc_count;
-+
-+    acldvppPicDesc *pic_desc_pool[ASCEND_DESC_POOL_SZ];
-+    int pic_desc_count;
 +
 +    /* libascendcl.so */
 +    aclError (*aclrtSetCurrentContext)(aclrtContext);
@@ -510,106 +499,6 @@
 +    pthread_mutex_unlock(&ctx->lock);
 +}
 +
-+static acldvppStreamDesc *stream_desc_get(AscendDecodeContext *ctx)
-+{
-+    acldvppStreamDesc *d = NULL;
-+    pthread_mutex_lock(&ctx->lock);
-+    if (ctx->stream_desc_count > 0)
-+        d = ctx->stream_desc_pool[--ctx->stream_desc_count];
-+    pthread_mutex_unlock(&ctx->lock);
-+    if (d) {
-+        ctx->acldvppSetStreamDescEos(d, 0);
-+        return d;
-+    }
-+    return ctx->acldvppCreateStreamDesc();
-+}
-+
-+static void stream_desc_put(AscendDecodeContext *ctx, acldvppStreamDesc *d)
-+{
-+    if (!d)
-+        return;
-+    pthread_mutex_lock(&ctx->lock);
-+    if (ctx->stream_desc_count < ASCEND_DESC_POOL_SZ) {
-+        ctx->stream_desc_pool[ctx->stream_desc_count++] = d;
-+        pthread_mutex_unlock(&ctx->lock);
-+        return;
-+    }
-+    pthread_mutex_unlock(&ctx->lock);
-+    if (ctx->acldvppDestroyStreamDesc)
-+        ctx->acldvppDestroyStreamDesc(d);
-+}
-+
-+static acldvppPicDesc *pic_desc_get(AscendDecodeContext *ctx)
-+{
-+    acldvppPicDesc *d = NULL;
-+    pthread_mutex_lock(&ctx->lock);
-+    if (ctx->pic_desc_count > 0)
-+        d = ctx->pic_desc_pool[--ctx->pic_desc_count];
-+    pthread_mutex_unlock(&ctx->lock);
-+    if (d)
-+        return d;
-+    return ctx->acldvppCreatePicDesc();
-+}
-+
-+static void pic_desc_put(AscendDecodeContext *ctx, acldvppPicDesc *d)
-+{
-+    if (!d)
-+        return;
-+    pthread_mutex_lock(&ctx->lock);
-+    if (ctx->pic_desc_count < ASCEND_DESC_POOL_SZ) {
-+        ctx->pic_desc_pool[ctx->pic_desc_count++] = d;
-+        pthread_mutex_unlock(&ctx->lock);
-+        return;
-+    }
-+    pthread_mutex_unlock(&ctx->lock);
-+    if (ctx->acldvppDestroyPicDesc)
-+        ctx->acldvppDestroyPicDesc(d);
-+}
-+
-+static void desc_pools_clear(AscendDecodeContext *ctx)
-+{
-+    pthread_mutex_lock(&ctx->lock);
-+    while (ctx->stream_desc_count > 0) {
-+        acldvppStreamDesc *s = ctx->stream_desc_pool[--ctx->stream_desc_count];
-+        if (s && ctx->acldvppDestroyStreamDesc)
-+            ctx->acldvppDestroyStreamDesc(s);
-+    }
-+    while (ctx->pic_desc_count > 0) {
-+        acldvppPicDesc *p = ctx->pic_desc_pool[--ctx->pic_desc_count];
-+        if (p && ctx->acldvppDestroyPicDesc)
-+            ctx->acldvppDestroyPicDesc(p);
-+    }
-+    pthread_mutex_unlock(&ctx->lock);
-+}
-+
-+static int ensure_host_pkt_buf(AscendDecodeContext *ctx, size_t need_size)
-+{
-+    size_t alloc_size;
-+    if (ctx->host_pkt_buf && ctx->host_pkt_cap >= need_size)
-+        return 0;
-+    if (ctx->host_pkt_buf && ctx->aclrtFreeHost) {
-+        ctx->aclrtFreeHost(ctx->host_pkt_buf);
-+        ctx->host_pkt_buf = NULL;
-+        ctx->host_pkt_cap = 0;
-+    }
-+    alloc_size = FFMAX(need_size, (size_t)ASCEND_IN_MIN_ALLOC);
-+    if (ctx->aclrtMallocHost(&ctx->host_pkt_buf, alloc_size) != ACL_SUCCESS ||
-+        !ctx->host_pkt_buf) {
-+        ctx->host_pkt_buf = NULL;
-+        return AVERROR(ENOMEM);
-+    }
-+    ctx->host_pkt_cap = alloc_size;
-+    return 0;
-+}
-+
-+static void free_host_pkt_buf(AscendDecodeContext *ctx)
-+{
-+    if (ctx->host_pkt_buf && ctx->aclrtFreeHost)
-+        ctx->aclrtFreeHost(ctx->host_pkt_buf);
-+    ctx->host_pkt_buf = NULL;
-+    ctx->host_pkt_cap = 0;
-+}
-+
 +static void ascend_host_buf_free(void *opaque, uint8_t *data)
 +{
 +    aclError (*free_host)(void *) = opaque;
@@ -625,15 +514,16 @@
 +
 +    if (ctx->context && ctx->aclrtSetCurrentContext)
 +        ctx->aclrtSetCurrentContext(ctx->context);
-+    if (ctx->aclrtMallocHost(&ptr, size) != ACL_SUCCESS || !ptr)
-+        return NULL;
-+    ref = av_buffer_create((uint8_t *)ptr, size, ascend_host_buf_free,
-+                           ctx->aclrtFreeHost, 0);
-+    if (!ref) {
-+        ctx->aclrtFreeHost(ptr);
-+        return NULL;
++    if (ctx->aclrtMallocHost(&ptr, size) == ACL_SUCCESS && ptr) {
++        ref = av_buffer_create((uint8_t *)ptr, size, ascend_host_buf_free,
++                               ctx->aclrtFreeHost, 0);
++        if (!ref) {
++            ctx->aclrtFreeHost(ptr);
++            return NULL;
++        }
++        return ref;
 +    }
-+    return ref;
++    return av_buffer_alloc(size);
 +}
 +
 +static int ascend_ensure_host_pool(AscendDecodeContext *ctx, size_t need_size)
@@ -664,7 +554,7 @@
 +            void *dev = ctx->acldvppGetPicDescData(f->pic);
 +            if (dev)
 +                out_pool_put(ctx, dev);
-+            pic_desc_put(ctx, f->pic);
++            ctx->acldvppDestroyPicDesc(f->pic);
 +            f->pic = NULL;
 +        }
 +        ctx->queue_head = (ctx->queue_head + 1) % ASCEND_QUEUE_DEPTH;
@@ -691,7 +581,7 @@
 +            void *dev = ctx->acldvppGetPicDescData(old->pic);
 +            if (dev)
 +                out_pool_put(ctx, dev);
-+            pic_desc_put(ctx, old->pic);
++            ctx->acldvppDestroyPicDesc(old->pic);
 +            old->pic = NULL;
 +        }
 +        ctx->queue_head = (ctx->queue_head + 1) % ASCEND_QUEUE_DEPTH;
@@ -730,28 +620,13 @@
 +{
 +    AscendFrameMeta *meta = user_data;
 +    AscendDecodeContext *ctx = meta ? meta->ctx : NULL;
-+
-+    if (meta && meta->is_eos) {
-+        if (input && ctx) {
-+            if (ctx->acldvppDestroyStreamDesc)
-+                ctx->acldvppDestroyStreamDesc(input);
-+        }
-+        if (ctx) {
-+            atomic_fetch_sub(&ctx->in_flight, 1);
-+            pthread_mutex_lock(&ctx->lock);
-+            ctx->eos_done = 1;
-+            pthread_cond_broadcast(&ctx->cond);
-+            pthread_mutex_unlock(&ctx->lock);
-+        }
-+        av_free(meta);
-+        return;
-+    }
++    int pushed = 0;
 +
 +    if (input && ctx) {
 +        void *in_dev = ctx->acldvppGetStreamDescData(input);
 +        if (in_dev)
 +            in_pool_put(ctx, in_dev, meta ? meta->in_cap : 0);
-+        stream_desc_put(ctx, input);
++        ctx->acldvppDestroyStreamDesc(input);
 +    }
 +
 +    if (meta) {
@@ -764,20 +639,23 @@
 +        if (!ret_code) {
 +            queue_push(ctx, output, meta ? meta->pts : AV_NOPTS_VALUE,
 +                       meta ? meta->dts : AV_NOPTS_VALUE);
++            pushed = 1;
 +        } else {
 +            void *dev = ctx->acldvppGetPicDescData(output);
 +            if (dev)
 +                out_pool_put(ctx, dev);
-+            pic_desc_put(ctx, output);
++            ctx->acldvppDestroyPicDesc(output);
 +            av_log(NULL, ret_code == 0x20000 ? AV_LOG_DEBUG : AV_LOG_WARNING,
 +                   "[Ascend] VDEC frame failed, retCode=0x%x\n", ret_code);
 +        }
 +    }
 +
 +    if (meta) {
-+        pthread_mutex_lock(&ctx->lock);
-+        pthread_cond_broadcast(&ctx->cond);
-+        pthread_mutex_unlock(&ctx->lock);
++        if (!pushed) {
++            pthread_mutex_lock(&ctx->lock);
++            pthread_cond_broadcast(&ctx->cond);
++            pthread_mutex_unlock(&ctx->lock);
++        }
 +        av_free(meta);
 +    }
 +}
@@ -871,15 +749,18 @@
 +static void get_dimensions(AVCodecContext *avctx, int *width, int *height,
 +                           int *coded_w, int *coded_h)
 +{
-+    int w  = avctx->width        > 0 ? avctx->width        : 1920;
-+    int h  = avctx->height       > 0 ? avctx->height       : 1080;
-+    int cw = avctx->coded_width  > 0 ? avctx->coded_width  : w;
-+    int ch = avctx->coded_height > 0 ? avctx->coded_height : h;
-+
-+    *width   = w;
-+    *height  = h;
-+    *coded_w = FFMAX(cw, w);
-+    *coded_h = FFMAX(ch, h);
++    *coded_w = avctx->coded_width  > 0 ? avctx->coded_width  : avctx->width;
++    *coded_h = avctx->coded_height > 0 ? avctx->coded_height : avctx->height;
++    *width   = avctx->width        > 0 ? avctx->width        : *coded_w;
++    *height  = avctx->height       > 0 ? avctx->height       : *coded_h;
++    if (*coded_w <= 0)
++        *coded_w = *width > 0 ? *width : 1920;
++    if (*coded_h <= 0)
++        *coded_h = *height > 0 ? *height : 1080;
++    if (*width <= 0)
++        *width = *coded_w;
++    if (*height <= 0)
++        *height = *coded_h;
 +}
 +
 +static void ascend_destroy_channel(AscendDecodeContext *ctx)
@@ -953,46 +834,46 @@
 +    int ch = start_ch;
 +    aclError ret = ACL_ERROR_INVALID_PARAM;
 +
-+    ctx->channel_desc = ctx->aclvdecCreateChannelDesc();
-+    if (!ctx->channel_desc) {
-+        av_log(avctx, AV_LOG_ERROR, "[Ascend] aclvdecCreateChannelDesc failed\n");
-+        return AVERROR_EXTERNAL;
-+    }
-+
-+    ret  = ctx->aclvdecSetChannelDescThreadId(ctx->channel_desc, ctx->callback_tid);
-+    ret |= ctx->aclvdecSetChannelDescCallback(ctx->channel_desc, ascend_vdec_callback);
-+    ret |= ctx->aclvdecSetChannelDescEnType(ctx->channel_desc, map_en_type(avctx));
-+    ret |= ctx->aclvdecSetChannelDescOutPicFormat(ctx->channel_desc,
-+                                                  PIXEL_FORMAT_YUV_SEMIPLANAR_420);
-+    if (ctx->aclvdecSetChannelDescOutPicWidth)
-+        ctx->aclvdecSetChannelDescOutPicWidth(ctx->channel_desc, stride_w);
-+    if (ctx->aclvdecSetChannelDescOutPicHeight)
-+        ctx->aclvdecSetChannelDescOutPicHeight(ctx->channel_desc, stride_h);
-+
-+    if (ret != ACL_SUCCESS) {
-+        av_log(avctx, AV_LOG_ERROR, "[Ascend] channel descriptor setup failed\n");
-+        ctx->aclvdecDestroyChannelDesc(ctx->channel_desc);
-+        ctx->channel_desc = NULL;
-+        return AVERROR_EXTERNAL;
-+    }
-+
-+    /* Auto-hunt available channel ID across [0..255] if specified channel is busy */
++    /* Auto-hunt available channel ID across [0..255] with a clean descriptor per attempt */
 +    for (int attempt = 0; attempt < 256; attempt++) {
-+        ctx->aclvdecSetChannelDescChannelId(ctx->channel_desc, (uint32_t)ch);
++        ctx->channel_desc = ctx->aclvdecCreateChannelDesc();
++        if (!ctx->channel_desc) {
++            av_log(avctx, AV_LOG_ERROR, "[Ascend] aclvdecCreateChannelDesc failed\n");
++            return AVERROR_EXTERNAL;
++        }
++
++        ret  = ctx->aclvdecSetChannelDescChannelId(ctx->channel_desc, (uint32_t)ch);
++        ret |= ctx->aclvdecSetChannelDescThreadId(ctx->channel_desc, ctx->callback_tid);
++        ret |= ctx->aclvdecSetChannelDescCallback(ctx->channel_desc, ascend_vdec_callback);
++        ret |= ctx->aclvdecSetChannelDescEnType(ctx->channel_desc, map_en_type(avctx));
++        ret |= ctx->aclvdecSetChannelDescOutPicFormat(ctx->channel_desc,
++                                                      PIXEL_FORMAT_YUV_SEMIPLANAR_420);
++        if (ctx->aclvdecSetChannelDescOutPicWidth)
++            ctx->aclvdecSetChannelDescOutPicWidth(ctx->channel_desc, coded_w);
++        if (ctx->aclvdecSetChannelDescOutPicHeight)
++            ctx->aclvdecSetChannelDescOutPicHeight(ctx->channel_desc, coded_h);
++
++        if (ret != ACL_SUCCESS) {
++            av_log(avctx, AV_LOG_ERROR, "[Ascend] channel descriptor setup failed\n");
++            ctx->aclvdecDestroyChannelDesc(ctx->channel_desc);
++            ctx->channel_desc = NULL;
++            return AVERROR_EXTERNAL;
++        }
++
 +        ret = ctx->aclvdecCreateChannel(ctx->channel_desc);
 +        if (ret == ACL_SUCCESS) {
 +            ctx->channel_id = ch;
 +            break;
 +        }
++        ctx->aclvdecDestroyChannelDesc(ctx->channel_desc);
++        ctx->channel_desc = NULL;
 +        ch = (ch + 1) % 256;
 +    }
 +
-+    if (ret != ACL_SUCCESS) {
++    if (ret != ACL_SUCCESS || !ctx->channel_desc) {
 +        av_log(avctx, AV_LOG_ERROR,
 +               "[Ascend] aclvdecCreateChannel(ch=%d..%d, %dx%d) failed: 0x%x\n",
 +               start_ch, (start_ch + 255) % 256, coded_w, coded_h, ret);
-+        ctx->aclvdecDestroyChannelDesc(ctx->channel_desc);
-+        ctx->channel_desc = NULL;
 +        return AVERROR_EXTERNAL;
 +    }
 +
@@ -1071,7 +952,6 @@
 +    void *in_dev = NULL;
 +    size_t in_cap = 0;
 +    void *out_dev = NULL;
-+    const void *src_host = pkt->data;
 +    int width, height, coded_w, coded_h;
 +    uint32_t stride_w, stride_h;
 +    size_t out_size;
@@ -1097,36 +977,31 @@
 +    if (ret < 0)
 +        return ret;
 +
-+    if (ensure_host_pkt_buf(ctx, pkt->size) == 0) {
-+        memcpy(ctx->host_pkt_buf, pkt->data, pkt->size);
-+        src_host = ctx->host_pkt_buf;
-+    }
-+
-+    if (ctx->aclrtMemcpy(in_dev, in_cap, src_host, pkt->size,
++    if (ctx->aclrtMemcpy(in_dev, in_cap, pkt->data, pkt->size,
 +                         ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
 +        in_pool_put(ctx, in_dev, in_cap);
 +        return AVERROR_EXTERNAL;
 +    }
 +
-+    stream = stream_desc_get(ctx);
++    stream = ctx->acldvppCreateStreamDesc();
 +    if (!stream) {
 +        in_pool_put(ctx, in_dev, in_cap);
 +        return AVERROR(ENOMEM);
 +    }
 +    if (ctx->acldvppSetStreamDescData(stream, in_dev) != ACL_SUCCESS ||
 +        ctx->acldvppSetStreamDescSize(stream, pkt->size) != ACL_SUCCESS) {
-+        stream_desc_put(ctx, stream);
++        ctx->acldvppDestroyStreamDesc(stream);
 +        in_pool_put(ctx, in_dev, in_cap);
 +        return AVERROR_EXTERNAL;
 +    }
 +
 +    out_dev = out_pool_get(ctx, out_size);
 +    if (!out_dev) {
-+        stream_desc_put(ctx, stream);
++        ctx->acldvppDestroyStreamDesc(stream);
 +        in_pool_put(ctx, in_dev, in_cap);
 +        return AVERROR(ENOMEM);
 +    }
-+    pic = pic_desc_get(ctx);
++    pic = ctx->acldvppCreatePicDesc();
 +    if (!pic ||
 +        ctx->acldvppSetPicDescData(pic, out_dev) != ACL_SUCCESS ||
 +        ctx->acldvppSetPicDescSize(pic, out_size) != ACL_SUCCESS ||
@@ -1136,18 +1011,18 @@
 +        ctx->acldvppSetPicDescWidthStride(pic, stride_w) != ACL_SUCCESS ||
 +        ctx->acldvppSetPicDescHeightStride(pic, stride_h) != ACL_SUCCESS) {
 +        if (pic)
-+            pic_desc_put(ctx, pic);
++            ctx->acldvppDestroyPicDesc(pic);
 +        out_pool_put(ctx, out_dev);
-+        stream_desc_put(ctx, stream);
++        ctx->acldvppDestroyStreamDesc(stream);
 +        in_pool_put(ctx, in_dev, in_cap);
 +        return AVERROR_EXTERNAL;
 +    }
 +
 +    meta = av_mallocz(sizeof(*meta));
 +    if (!meta) {
-+        pic_desc_put(ctx, pic);
++        ctx->acldvppDestroyPicDesc(pic);
 +        out_pool_put(ctx, out_dev);
-+        stream_desc_put(ctx, stream);
++        ctx->acldvppDestroyStreamDesc(stream);
 +        in_pool_put(ctx, in_dev, in_cap);
 +        return AVERROR(ENOMEM);
 +    }
@@ -1155,7 +1030,6 @@
 +    meta->in_cap = in_cap;
 +    meta->pts = pkt->pts;
 +    meta->dts = pkt->dts;
-+    meta->is_eos = 0;
 +
 +    atomic_fetch_add(&ctx->in_flight, 1);
 +    for (;;) {
@@ -1172,9 +1046,9 @@
 +        av_log(avctx, AV_LOG_ERROR,
 +               "[Ascend] aclvdecSendFrame failed: 0x%x\n", acl_ret);
 +        av_free(meta);
-+        pic_desc_put(ctx, pic);
++        ctx->acldvppDestroyPicDesc(pic);
 +        out_pool_put(ctx, out_dev);
-+        stream_desc_put(ctx, stream);
++        ctx->acldvppDestroyStreamDesc(stream);
 +        in_pool_put(ctx, in_dev, in_cap);
 +        return AVERROR_EXTERNAL;
 +    }
@@ -1186,7 +1060,6 @@
 +{
 +    AscendDecodeContext *ctx = avctx->priv_data;
 +    acldvppStreamDesc *stream;
-+    AscendFrameMeta *meta;
 +    int attempts = 0;
 +    aclError ret;
 +
@@ -1207,17 +1080,8 @@
 +        return AVERROR_EXTERNAL;
 +    }
 +
-+    meta = av_mallocz(sizeof(*meta));
-+    if (!meta) {
-+        ctx->acldvppDestroyStreamDesc(stream);
-+        return AVERROR(ENOMEM);
-+    }
-+    meta->ctx    = ctx;
-+    meta->is_eos = 1;
-+
-+    atomic_fetch_add(&ctx->in_flight, 1);
 +    for (;;) {
-+        ret = ctx->aclvdecSendFrame(ctx->channel_desc, stream, NULL, NULL, meta);
++        ret = ctx->aclvdecSendFrame(ctx->channel_desc, stream, NULL, NULL, NULL);
 +        if (ret == ACL_SUCCESS)
 +            break;
 +        if ((int)ret == ASCEND_VDEC_BUF_FULL && attempts++ < 5000 &&
@@ -1225,12 +1089,11 @@
 +            av_usleep(1000);
 +            continue;
 +        }
-+        atomic_fetch_sub(&ctx->in_flight, 1);
 +        ctx->acldvppDestroyStreamDesc(stream);
-+        av_free(meta);
 +        av_log(avctx, AV_LOG_ERROR, "[Ascend] EOS send failed: 0x%x\n", ret);
 +        return AVERROR_EXTERNAL;
 +    }
++    ctx->acldvppDestroyStreamDesc(stream);
 +    return 0;
 +}
 +
@@ -1238,6 +1101,8 @@
 +{
 +    AscendDecodeContext *ctx = avctx->priv_data;
 +    AscendFrame item;
++    int poll_waited = 0;
++    int sent_pkt = 0;
 +    int waited_ms = 0;
 +    int ret;
 +
@@ -1249,9 +1114,7 @@
 +            return AVERROR_EXTERNAL;
 +    }
 +
-+    /* Flow control / backpressure: drain packets as long as output queue is not clogged */
-+    while (!ctx->eof_reached &&
-+           ctx->queue_count < ASCEND_QUEUE_DEPTH / 2) {
++    while (!ctx->eof_reached) {
 +        ret = ff_decode_get_packet(avctx, ctx->pkt);
 +        if (ret == AVERROR_EOF) {
 +            ctx->eof_reached = 1;
@@ -1266,6 +1129,7 @@
 +        av_packet_unref(ctx->pkt);
 +        if (ret < 0)
 +            return ret;
++        sent_pkt = 1;
 +    }
 +
 +    for (;;) {
@@ -1282,20 +1146,19 @@
 +            return AVERROR_EOF;
 +        }
 +        if (!ctx->eof_reached) {
-+            /* If we have frames in flight and need an output frame, wait for callback */
-+            if (atomic_load(&ctx->in_flight) > 0) {
++            if (sent_pkt && !poll_waited &&
++                atomic_load(&ctx->in_flight) >= 8) {
 +                struct timespec ts;
++                poll_waited = 1;
 +                clock_gettime(CLOCK_REALTIME, &ts);
-+                ts.tv_nsec += 10 * 1000000;
++                ts.tv_nsec += 5 * 1000000;
 +                if (ts.tv_nsec >= 1000000000) {
 +                    ts.tv_sec++;
 +                    ts.tv_nsec -= 1000000000;
 +                }
 +                pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
-+                if (ctx->queue_count > 0) {
-+                    pthread_mutex_unlock(&ctx->lock);
-+                    continue;
-+                }
++                pthread_mutex_unlock(&ctx->lock);
++                continue;
 +            }
 +            pthread_mutex_unlock(&ctx->lock);
 +            return AVERROR(EAGAIN);
@@ -1308,7 +1171,8 @@
 +                return ret;
 +            continue;
 +        }
-+        if (!atomic_load(&ctx->in_flight) && ctx->eos_done) {
++        if (!atomic_load(&ctx->in_flight)) {
++            ctx->eos_done = 1;
 +            pthread_mutex_unlock(&ctx->lock);
 +            return AVERROR_EOF;
 +        }
@@ -1390,7 +1254,7 @@
 +            if (!frame->hw_frames_ctx) {
 +                ret = AVERROR(ENOMEM);
 +                av_frame_unref(frame);
-+                pic_desc_put(ctx, item.pic);
++                ctx->acldvppDestroyPicDesc(item.pic);
 +                return ret;
 +            }
 +            frame->data[0]     = (uint8_t *)dev;
@@ -1422,7 +1286,7 @@
 +            frame->linesize[1] = (int)stride_w;
 +        }
 +    }
-+    pic_desc_put(ctx, item.pic);
++    ctx->acldvppDestroyPicDesc(item.pic);
 +    return 0;
 +
 +fail_pic:
@@ -1431,7 +1295,7 @@
 +        if (dev)
 +            out_pool_put(ctx, dev);
 +    }
-+    pic_desc_put(ctx, item.pic);
++    ctx->acldvppDestroyPicDesc(item.pic);
 +    av_frame_unref(frame);
 +    return ret;
 +}
@@ -1471,8 +1335,6 @@
 +    ctx->codec_id = avctx->codec_id;
 +    ctx->queue_head = ctx->queue_tail = ctx->queue_count = 0;
 +    ctx->in_pool_count = 0;
-+    ctx->stream_desc_count = 0;
-+    ctx->pic_desc_count = 0;
 +    ctx->eof_reached = ctx->eos_sent = ctx->eos_done = 0;
 +    atomic_init(&ctx->running, 0);
 +    atomic_init(&ctx->in_flight, 0);
@@ -1585,9 +1447,7 @@
 +    out_pool_unref(ctx->out_pool);
 +    ctx->out_pool = NULL;
 +    in_pool_clear(ctx);
-+    desc_pools_clear(ctx);
 +    ascend_free_host_pool(ctx);
-+    free_host_pkt_buf(ctx);
 +    av_packet_free(&ctx->pkt);
 +    av_buffer_unref(&ctx->hw_frames_ref);
 +    av_buffer_unref(&ctx->hw_device_ref);
@@ -1716,7 +1576,7 @@
 +};
 --- /dev/null
 +++ b/libavcodec/ascendenc.c
-@@ -0,0 +1,913 @@
+@@ -0,0 +1,889 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 hardware encoder (h264_ascend / hevc_ascend).
 + *
@@ -1756,9 +1616,10 @@
 +#include <acl/ops/acl_dvpp.h>
 +
 +#define ASCEND_ENC_ALIGN_W    16
-+#define ASCEND_ENC_ALIGN_H    16
++#define ASCEND_ENC_ALIGN_H    2
 +#define ASCEND_ENC_QUEUE_SZ   64
 +#define ASCEND_ENC_POOL_SZ    36
++#define ASCEND_VENC_BUF_FULL  507018
 +
 +#ifndef _WIN32
 +
@@ -1766,6 +1627,7 @@
 +#include <pthread.h>
 +#include <stdatomic.h>
 +#include <time.h>
++#include <unistd.h>
 +
 +typedef struct AscendEncPkt {
 +    uint8_t *data;
@@ -1782,7 +1644,6 @@
 +    int64_t pts;
 +    int64_t dts;
 +    int keyframe;
-+    int is_eos;
 +} AscendEncMeta;
 +
 +typedef struct AscendEncodeContext {
@@ -1814,9 +1675,6 @@
 +    int queue_head;
 +    int queue_tail;
 +    int queue_count;
-+
-+    acldvppPicDesc *pic_desc_pool[ASCEND_ENC_QUEUE_SZ];
-+    int pic_desc_count;
 +
 +    int eof_sent;
 +    int eos_done;
@@ -1942,44 +1800,6 @@
 +    pthread_mutex_unlock(&ctx->lock);
 +}
 +
-+static acldvppPicDesc *enc_pic_desc_get(AscendEncodeContext *ctx)
-+{
-+    pthread_mutex_lock(&ctx->lock);
-+    if (ctx->pic_desc_count > 0) {
-+        acldvppPicDesc *p = ctx->pic_desc_pool[--ctx->pic_desc_count];
-+        pthread_mutex_unlock(&ctx->lock);
-+        return p;
-+    }
-+    pthread_mutex_unlock(&ctx->lock);
-+    return ctx->acldvppCreatePicDesc ? ctx->acldvppCreatePicDesc() : NULL;
-+}
-+
-+static void enc_pic_desc_put(AscendEncodeContext *ctx, acldvppPicDesc *p)
-+{
-+    if (!p)
-+        return;
-+    pthread_mutex_lock(&ctx->lock);
-+    if (ctx->pic_desc_count < ASCEND_ENC_QUEUE_SZ) {
-+        ctx->pic_desc_pool[ctx->pic_desc_count++] = p;
-+        pthread_mutex_unlock(&ctx->lock);
-+        return;
-+    }
-+    pthread_mutex_unlock(&ctx->lock);
-+    if (ctx->acldvppDestroyPicDesc)
-+        ctx->acldvppDestroyPicDesc(p);
-+}
-+
-+static void enc_pic_desc_pool_clear(AscendEncodeContext *ctx)
-+{
-+    pthread_mutex_lock(&ctx->lock);
-+    while (ctx->pic_desc_count > 0) {
-+        acldvppPicDesc *p = ctx->pic_desc_pool[--ctx->pic_desc_count];
-+        if (p && ctx->acldvppDestroyPicDesc)
-+            ctx->acldvppDestroyPicDesc(p);
-+    }
-+    pthread_mutex_unlock(&ctx->lock);
-+}
-+
 +static void *ascend_enc_cb_thread(void *arg)
 +{
 +    AscendEncodeContext *ctx = arg;
@@ -2004,27 +1824,17 @@
 +{
 +    AscendEncMeta *meta = userdata;
 +    AscendEncodeContext *ctx = meta ? meta->ctx : NULL;
++    int notified = 0;
 +
-+    if (input && ctx)
-+        enc_pic_desc_put(ctx, input);
++    if (input && ctx && ctx->acldvppDestroyPicDesc)
++        ctx->acldvppDestroyPicDesc(input);
 +
 +    if (meta && ctx) {
 +        if (meta->in_dev)
 +            enc_in_pool_put(ctx, meta->in_dev);
 +        if (meta->hw_frame_ref)
 +            av_frame_free(&meta->hw_frame_ref);
-+    }
-+
-+    if (meta && meta->is_eos) {
-+        if (ctx) {
-+            atomic_fetch_sub(&ctx->in_flight, 1);
-+            pthread_mutex_lock(&ctx->lock);
-+            ctx->eos_done = 1;
-+            pthread_cond_broadcast(&ctx->cond);
-+            pthread_mutex_unlock(&ctx->lock);
-+        }
-+        av_free(meta);
-+        return;
++        atomic_fetch_sub(&ctx->in_flight, 1);
 +    }
 +
 +    if (output && ctx) {
@@ -2042,7 +1852,7 @@
 +
 +                pthread_mutex_lock(&ctx->lock);
 +                if (ctx->queue_count < ASCEND_ENC_QUEUE_SZ) {
-+                    AscendEncPkt * slot = &ctx->queue[ctx->queue_tail];
++                    AscendEncPkt *slot = &ctx->queue[ctx->queue_tail];
 +                    slot->data  = buf;
 +                    slot->size  = (int)ssize;
 +                    slot->pts   = meta ? meta->pts : AV_NOPTS_VALUE;
@@ -2055,15 +1865,17 @@
 +                }
 +                pthread_cond_broadcast(&ctx->cond);
 +                pthread_mutex_unlock(&ctx->lock);
++                notified = 1;
 +            }
 +        }
 +    }
 +
 +    if (meta && ctx) {
-+        atomic_fetch_sub(&ctx->in_flight, 1);
-+        pthread_mutex_lock(&ctx->lock);
-+        pthread_cond_broadcast(&ctx->cond);
-+        pthread_mutex_unlock(&ctx->lock);
++        if (!notified) {
++            pthread_mutex_lock(&ctx->lock);
++            pthread_cond_broadcast(&ctx->cond);
++            pthread_mutex_unlock(&ctx->lock);
++        }
 +        av_free(meta);
 +    }
 +}
@@ -2345,7 +2157,7 @@
 +        return AVERROR(EINVAL);
 +    }
 +
-+    pic = enc_pic_desc_get(ctx);
++    pic = ctx->acldvppCreatePicDesc();
 +    if (!pic) {
 +        if (in_dev)
 +            enc_in_pool_put(ctx, in_dev);
@@ -2362,7 +2174,7 @@
 +
 +    meta = av_mallocz(sizeof(*meta));
 +    if (!meta) {
-+        enc_pic_desc_put(ctx, pic);
++        ctx->acldvppDestroyPicDesc(pic);
 +        if (in_dev)
 +            enc_in_pool_put(ctx, in_dev);
 +        av_frame_free(&hw_ref);
@@ -2374,16 +2186,23 @@
 +    meta->pts          = frame->pts;
 +    meta->dts          = frame->pts;
 +    meta->keyframe     = keyframe;
-+    meta->is_eos       = 0;
 +
 +    ctx->aclvencSetFrameConfigEos(ctx->frame_cfg, 0);
 +    ctx->aclvencSetFrameConfigForceIFrame(ctx->frame_cfg, keyframe ? 1 : 0);
 +
 +    atomic_fetch_add(&ctx->in_flight, 1);
-+    if (ctx->aclvencSendFrame(ctx->channel_desc, pic, NULL,
-+                              ctx->frame_cfg, meta) != ACL_SUCCESS) {
++    for (int attempts = 0;;) {
++        aclError acl_ret = ctx->aclvencSendFrame(ctx->channel_desc, pic, NULL,
++                                                 ctx->frame_cfg, meta);
++        if (acl_ret == ACL_SUCCESS)
++            break;
++        if ((int)acl_ret == ASCEND_VENC_BUF_FULL && attempts++ < 5000 &&
++            atomic_load(&ctx->running)) {
++            av_usleep(1000);
++            continue;
++        }
 +        atomic_fetch_sub(&ctx->in_flight, 1);
-+        enc_pic_desc_put(ctx, pic);
++        ctx->acldvppDestroyPicDesc(pic);
 +        if (in_dev)
 +            enc_in_pool_put(ctx, in_dev);
 +        av_frame_free(&hw_ref);
@@ -2396,6 +2215,9 @@
 +static int ascend_encode_receive_packet(AVCodecContext *avctx, AVPacket *pkt)
 +{
 +    AscendEncodeContext *ctx = avctx->priv_data;
++    int poll_waited = 0;
++    int sent_frame = 0;
++    int waited_ms = 0;
 +    int ret;
 +
 +    if (!ctx->initialized)
@@ -2406,20 +2228,19 @@
 +    while (!ctx->eof_sent) {
 +        ret = ff_encode_get_frame(avctx, ctx->frame);
 +        if (ret == AVERROR_EOF) {
-+            AscendEncMeta *meta = av_mallocz(sizeof(*meta));
-+            if (!meta)
-+                return AVERROR(ENOMEM);
-+            meta->ctx    = ctx;
-+            meta->is_eos = 1;
-+
 +            ctx->eof_sent = 1;
 +            ctx->aclvencSetFrameConfigEos(ctx->frame_cfg, 1);
 +            ctx->aclvencSetFrameConfigForceIFrame(ctx->frame_cfg, 0);
-+            atomic_fetch_add(&ctx->in_flight, 1);
-+            if (ctx->aclvencSendFrame(ctx->channel_desc, NULL, NULL,
-+                                      ctx->frame_cfg, meta) != ACL_SUCCESS) {
-+                atomic_fetch_sub(&ctx->in_flight, 1);
-+                av_free(meta);
++            for (int attempts = 0;;) {
++                aclError acl_ret = ctx->aclvencSendFrame(ctx->channel_desc, NULL,
++                                                         NULL, ctx->frame_cfg, NULL);
++                if (acl_ret == ACL_SUCCESS)
++                    break;
++                if ((int)acl_ret == ASCEND_VENC_BUF_FULL && attempts++ < 5000 &&
++                    atomic_load(&ctx->running)) {
++                    av_usleep(1000);
++                    continue;
++                }
 +                return AVERROR_EXTERNAL;
 +            }
 +            break;
@@ -2433,7 +2254,7 @@
 +        av_frame_unref(ctx->frame);
 +        if (ret < 0)
 +            return ret;
-+        break;
++        sent_frame = 1;
 +    }
 +
 +    for (;;) {
@@ -2454,25 +2275,31 @@
 +            pkt->flags = item.flags;
 +            return 0;
 +        }
++        if (ctx->eos_done) {
++            pthread_mutex_unlock(&ctx->lock);
++            return AVERROR_EOF;
++        }
 +        if (!ctx->eof_sent) {
-+            if (atomic_load(&ctx->in_flight) >= 8) {
++            int inflight = atomic_load(&ctx->in_flight);
++            if (sent_frame && !poll_waited && inflight >= 8) {
 +                struct timespec ts;
++                long wait_ns = (inflight >= 24 ? 50L : 5L) * 1000000L;
++                poll_waited = 1;
 +                clock_gettime(CLOCK_REALTIME, &ts);
-+                ts.tv_nsec += 5 * 1000000;
-+                if (ts.tv_nsec >= 1000000000) {
++                ts.tv_nsec += wait_ns;
++                if (ts.tv_nsec >= 1000000000L) {
 +                    ts.tv_sec++;
-+                    ts.tv_nsec -= 1000000000;
++                    ts.tv_nsec -= 1000000000L;
 +                }
 +                pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
-+                if (ctx->queue_count > 0) {
-+                    pthread_mutex_unlock(&ctx->lock);
-+                    continue;
-+                }
++                pthread_mutex_unlock(&ctx->lock);
++                continue;
 +            }
 +            pthread_mutex_unlock(&ctx->lock);
 +            return AVERROR(EAGAIN);
 +        }
-+        if (!atomic_load(&ctx->in_flight) && ctx->eos_done) {
++        if (!atomic_load(&ctx->in_flight)) {
++            ctx->eos_done = 1;
 +            pthread_mutex_unlock(&ctx->lock);
 +            return AVERROR_EOF;
 +        }
@@ -2485,6 +2312,16 @@
 +                ts.tv_nsec -= 1000000000;
 +            }
 +            pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
++        }
++        if (ctx->queue_count > 0) {
++            pthread_mutex_unlock(&ctx->lock);
++            continue;
++        }
++        waited_ms += 20;
++        if (waited_ms >= 1000) {
++            ctx->eos_done = 1;
++            pthread_mutex_unlock(&ctx->lock);
++            return AVERROR_EOF;
 +        }
 +        pthread_mutex_unlock(&ctx->lock);
 +    }
@@ -2515,7 +2352,6 @@
 +    }
 +    enc_queue_clear(ctx);
 +    enc_in_pool_clear(ctx);
-+    enc_pic_desc_pool_clear(ctx);
 +    if (ctx->host_stage_buf && ctx->aclrtFreeHost)
 +        ctx->aclrtFreeHost(ctx->host_stage_buf);
 +    ctx->host_stage_buf = NULL;
@@ -3105,7 +2941,7 @@
  /**
 --- /dev/null
 +++ b/libavutil/hwcontext_ascend.c
-@@ -0,0 +1,605 @@
+@@ -0,0 +1,616 @@
 +/*
 + * Huawei Ascend DVPP hardware context implementation.
 + *
@@ -3247,9 +3083,8 @@
 +    return 0;
 +}
 +
-+static void ascend_atexit_cleanup(void)
++static void ascend_cleanup_unlocked(void)
 +{
-+    pthread_mutex_lock(&ascend_global_lock);
 +    for (int i = 0; i < (int)FF_ARRAY_ELEMS(ascend_device_refs); i++) {
 +        if (ascend_device_contexts[i] && ascend_syms.aclrtDestroyContext) {
 +            ascend_syms.aclrtDestroyContext(ascend_device_contexts[i]);
@@ -3265,12 +3100,21 @@
 +        if (ascend_syms.aclFinalize)
 +            ascend_syms.aclFinalize();
 +    }
++}
++
++static void ascend_atexit_cleanup(void)
++{
++    pthread_mutex_lock(&ascend_global_lock);
++    ascend_cleanup_unlocked();
 +    pthread_mutex_unlock(&ascend_global_lock);
 +}
 +
 +static void ascend_signal_handler(int sig)
 +{
-+    ascend_atexit_cleanup();
++    if (pthread_mutex_trylock(&ascend_global_lock) == 0) {
++        ascend_cleanup_unlocked();
++        pthread_mutex_unlock(&ascend_global_lock);
++    }
 +    signal(sig, SIG_DFL);
 +    raise(sig);
 +}
@@ -3295,15 +3139,18 @@
 +    }
 +
 +    if (!atexit_registered) {
-+        struct sigaction sa;
++        static const int sigs[] = { SIGINT, SIGTERM, SIGHUP };
++        struct sigaction sa, old_sa;
 +        atexit(ascend_atexit_cleanup);
 +        memset(&sa, 0, sizeof(sa));
 +        sa.sa_handler = ascend_signal_handler;
 +        sigemptyset(&sa.sa_mask);
 +        sa.sa_flags = SA_RESETHAND;
-+        sigaction(SIGINT, &sa, NULL);
-+        sigaction(SIGTERM, &sa, NULL);
-+        sigaction(SIGHUP, &sa, NULL);
++        for (int i = 0; i < (int)FF_ARRAY_ELEMS(sigs); i++) {
++            if (sigaction(sigs[i], NULL, &old_sa) == 0 &&
++                old_sa.sa_handler == SIG_DFL)
++                sigaction(sigs[i], &sa, NULL);
++        }
 +        atexit_registered = 1;
 +    }
 +
@@ -3733,7 +3580,7 @@
 +#include "hwcontext.h"
 +
 +#define ASCEND_ALIGN_W 128
-+#define ASCEND_ALIGN_H 16
++#define ASCEND_ALIGN_H 2
 +
 +/**
 + * Ascend device context allocated as AVHWDeviceContext.hwctx.
