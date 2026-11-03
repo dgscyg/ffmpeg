@@ -102,7 +102,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1574 @@
+@@ -0,0 +1,1605 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 hardware decoder.
 + *
@@ -171,21 +171,27 @@
 +} AscendInBuf;
 +
 +/*
-+ * Reference-counted output DVPP device buffer pool.
-+ * Holds its own reference to the Ascend device context so buffers can be
-+ * safely freed even if the decoder instance has already closed.
++ * Reference-counted Ascend device context holder.
++ * Allows the decoder and downstream AscendOutPool instances to share the exact
++ * same aclrtContext. When the decoder closes, downstream frames keeping AscendOutPool
++ * alive continue to hold a reference to AscendContextRef so acldvppFree can safely run,
++ * without creating a conflicting second context that breaks aclvdecSendFrame.
 + */
-+typedef struct AscendOutPool {
++typedef struct AscendContextRef {
 +    atomic_int refs;
-+    pthread_mutex_t lock;
-+    int closed;
 +    int device_id;
 +    aclrtContext context;
 +    void *acl_lib;
 +    void *dvpp_lib;
 +    aclError (*aclrtSetCurrentContext)(aclrtContext);
-+    aclError (*acldvppMalloc)(void **, size_t);
 +    aclError (*acldvppFree)(void *);
++} AscendContextRef;
++
++typedef struct AscendOutPool {
++    atomic_int refs;
++    pthread_mutex_t lock;
++    int closed;
++    AscendContextRef *cref;
 +    void *bufs[ASCEND_OUT_POOL_SIZE];
 +    int count;
 +    size_t buf_size;
@@ -218,6 +224,7 @@
 +    int initialized;
 +    int acl_acquired;
 +
++    AscendContextRef *cref;
 +    aclrtContext context;
 +    aclvdecChannelDesc *channel_desc;
 +    int channel_width;
@@ -325,26 +332,18 @@
 +    return (uint64_t)(uintptr_t)pthread_self();
 +}
 +
-+static AscendOutPool *out_pool_alloc(int device_id, void *log_ctx)
++static AscendOutPool *out_pool_alloc(AscendContextRef *cref)
 +{
-+    AscendOutPool *p = av_mallocz(sizeof(*p));
-+    int ret;
++    AscendOutPool *p;
++    if (!cref)
++        return NULL;
++    p = av_mallocz(sizeof(*p));
 +    if (!p)
 +        return NULL;
 +    atomic_init(&p->refs, 1);
 +    pthread_mutex_init(&p->lock, NULL);
-+    p->device_id = device_id;
-+
-+    ret = av_ascend_global_acquire(device_id, &p->acl_lib, &p->dvpp_lib,
-+                                   (void **)&p->context, log_ctx);
-+    if (ret < 0) {
-+        pthread_mutex_destroy(&p->lock);
-+        av_free(p);
-+        return NULL;
-+    }
-+    p->aclrtSetCurrentContext = (void *)get_dyn_sym(p->acl_lib, "aclrtSetCurrentContext");
-+    p->acldvppMalloc          = (void *)get_dyn_sym(p->dvpp_lib, "acldvppMalloc");
-+    p->acldvppFree            = (void *)get_dyn_sym(p->dvpp_lib, "acldvppFree");
++    atomic_fetch_add(&cref->refs, 1);
++    p->cref = cref;
 +    return p;
 +}
 +
@@ -353,15 +352,19 @@
 +    if (!p)
 +        return;
 +    if (atomic_fetch_sub(&p->refs, 1) == 1) {
-+        if (p->context && p->aclrtSetCurrentContext)
-+            p->aclrtSetCurrentContext(p->context);
++        AscendContextRef *cref = p->cref;
++        if (cref && cref->context && cref->aclrtSetCurrentContext)
++            cref->aclrtSetCurrentContext(cref->context);
 +        for (int i = 0; i < p->count; i++) {
-+            if (p->bufs[i] && p->acldvppFree)
-+                p->acldvppFree(p->bufs[i]);
++            if (p->bufs[i] && cref && cref->acldvppFree)
++                cref->acldvppFree(p->bufs[i]);
 +        }
 +        pthread_mutex_destroy(&p->lock);
-+        av_ascend_global_release(p->device_id, p->context);
 +        av_free(p);
++        if (cref && atomic_fetch_sub(&cref->refs, 1) == 1) {
++            av_ascend_global_release(cref->device_id, cref->context);
++            av_free(cref);
++        }
 +    }
 +}
 +
@@ -376,10 +379,10 @@
 +        return;
 +    }
 +    pthread_mutex_unlock(&p->lock);
-+    if (p->acldvppFree) {
-+        if (p->context && p->aclrtSetCurrentContext)
-+            p->aclrtSetCurrentContext(p->context);
-+        p->acldvppFree(dev);
++    if (p->cref && p->cref->acldvppFree) {
++        if (p->cref->context && p->cref->aclrtSetCurrentContext)
++            p->cref->aclrtSetCurrentContext(p->cref->context);
++        p->cref->acldvppFree(dev);
 +    }
 +}
 +
@@ -396,12 +399,12 @@
 +    pthread_mutex_lock(&p->lock);
 +    if (mark_closed)
 +        p->closed = 1;
-+    if (p->context && p->aclrtSetCurrentContext)
-+        p->aclrtSetCurrentContext(p->context);
++    if (p->cref && p->cref->context && p->cref->aclrtSetCurrentContext)
++        p->cref->aclrtSetCurrentContext(p->cref->context);
 +    while (p->count > 0) {
 +        void *dev = p->bufs[--p->count];
-+        if (dev && p->acldvppFree)
-+            p->acldvppFree(dev);
++        if (dev && p->cref && p->cref->acldvppFree)
++            p->cref->acldvppFree(dev);
 +    }
 +    p->buf_size = 0;
 +    pthread_mutex_unlock(&p->lock);
@@ -416,12 +419,12 @@
 +        return NULL;
 +    pthread_mutex_lock(&p->lock);
 +    if (p->buf_size != size) {
-+        if (p->context && p->aclrtSetCurrentContext)
-+            p->aclrtSetCurrentContext(p->context);
++        if (p->cref && p->cref->context && p->cref->aclrtSetCurrentContext)
++            p->cref->aclrtSetCurrentContext(p->cref->context);
 +        while (p->count > 0) {
 +            void *old = p->bufs[--p->count];
-+            if (old && p->acldvppFree)
-+                p->acldvppFree(old);
++            if (old && p->cref && p->cref->acldvppFree)
++                p->cref->acldvppFree(old);
 +        }
 +        p->buf_size = size;
 +    }
@@ -432,6 +435,8 @@
 +    }
 +    pthread_mutex_unlock(&p->lock);
 +
++    if (ctx->context && ctx->aclrtSetCurrentContext)
++        ctx->aclrtSetCurrentContext(ctx->context);
 +    if (ctx->acldvppMalloc(&dev, size) != ACL_SUCCESS)
 +        return NULL;
 +    return dev;
@@ -1034,7 +1039,7 @@
 +        /* Mark old pool closed and unref it; allocate a brand new pool for the new resolution */
 +        out_pool_clear(ctx, 1);
 +        out_pool_unref(ctx->out_pool);
-+        ctx->out_pool = out_pool_alloc(ctx->device_id, avctx);
++        ctx->out_pool = out_pool_alloc(ctx->cref);
 +        if (!ctx->out_pool)
 +            return AVERROR(ENOMEM);
 +
@@ -1060,6 +1065,9 @@
 +    size_t out_size;
 +    int attempts = 0;
 +    int ret;
++
++    if (ctx->context && ctx->aclrtSetCurrentContext)
++        ctx->aclrtSetCurrentContext(ctx->context);
 +
 +    get_dimensions(avctx, &width, &height, &coded_w, &coded_h);
 +    ret = ascend_ensure_channel(avctx);
@@ -1169,6 +1177,9 @@
 +    AscendFrameMeta *meta;
 +    int attempts = 0;
 +    aclError ret;
++
++    if (ctx->context && ctx->aclrtSetCurrentContext)
++        ctx->aclrtSetCurrentContext(ctx->context);
 +
 +    if (!ctx->channel_desc) {
 +        ctx->eos_done = 1;
@@ -1478,17 +1489,32 @@
 +    if (!ctx->pkt)
 +        return AVERROR(ENOMEM);
 +
-+    ret = av_ascend_global_acquire(ctx->device_id, &ctx->acl_lib,
-+                                   &ctx->dvpp_lib, (void **)&ctx->context, avctx);
-+    if (ret < 0)
++    AscendContextRef *cref = av_mallocz(sizeof(*cref));
++    if (!cref)
++        return AVERROR(ENOMEM);
++    atomic_init(&cref->refs, 1);
++    cref->device_id = ctx->device_id;
++
++    ret = av_ascend_global_acquire(ctx->device_id, &cref->acl_lib,
++                                   &cref->dvpp_lib, (void **)&cref->context, avctx);
++    if (ret < 0) {
++        av_free(cref);
 +        return ret;
++    }
++    cref->aclrtSetCurrentContext = (void *)get_dyn_sym(cref->acl_lib, "aclrtSetCurrentContext");
++    cref->acldvppFree            = (void *)get_dyn_sym(cref->dvpp_lib, "acldvppFree");
++
++    ctx->cref         = cref;
++    ctx->context      = cref->context;
++    ctx->acl_lib      = cref->acl_lib;
++    ctx->dvpp_lib     = cref->dvpp_lib;
 +    ctx->acl_acquired = 1;
 +
 +    ret = load_symbols(avctx);
 +    if (ret < 0)
 +        return ret;
 +
-+    ctx->out_pool = out_pool_alloc(ctx->device_id, avctx);
++    ctx->out_pool = out_pool_alloc(ctx->cref);
 +    if (!ctx->out_pool)
 +        return AVERROR(ENOMEM);
 +
@@ -1560,10 +1586,15 @@
 +    av_buffer_unref(&ctx->hw_frames_ref);
 +    av_buffer_unref(&ctx->hw_device_ref);
 +    atomic_store(&ctx->in_flight, 0);
-+    if (ctx->acl_acquired) {
-+        av_ascend_global_release(ctx->device_id, ctx->context);
++    if (ctx->cref) {
++        AscendContextRef *cref = ctx->cref;
++        ctx->cref = NULL;
 +        ctx->context = NULL;
 +        ctx->acl_acquired = 0;
++        if (atomic_fetch_sub(&cref->refs, 1) == 1) {
++            av_ascend_global_release(cref->device_id, cref->context);
++            av_free(cref);
++        }
 +    }
 +    ctx->dvpp_lib = ctx->acl_lib = NULL;
 +
