@@ -88,7 +88,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1369 @@
+@@ -0,0 +1,1364 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 decoder.
 + *
@@ -108,6 +108,7 @@
 +#include "avcodec.h"
 +#include "codec_internal.h"
 +#include "decode.h"
++#include "libavutil/buffer.h"
 +#include "libavutil/common.h"
 +#include "libavutil/error.h"
 +#include "libavutil/frame.h"
@@ -197,8 +198,8 @@
 +    int eos_done;
 +
 +    AVPacket *pkt;
-+    void *host_stage_buf;
-+    size_t host_stage_size;
++    AVBufferPool *host_frame_pool;
++    size_t host_frame_size;
 +
 +    void *out_pool[ASCEND_OUT_POOL_SIZE];
 +    int out_pool_count;
@@ -216,6 +217,8 @@
 +    aclError (*aclrtDestroyContext)(aclrtContext);
 +    aclError (*aclrtSetCurrentContext)(aclrtContext);
 +    aclError (*aclrtProcessReport)(int32_t);
++    aclError (*aclrtMallocHost)(void **, size_t);
++    aclError (*aclrtFreeHost)(void *);
 +    aclError (*aclrtMemcpy)(void *, size_t, const void *, size_t, aclrtMemcpyKind);
 +    aclError (*aclrtMemcpy2d)(void *, size_t, const void *, size_t,
 +                              size_t, size_t, aclrtMemcpyKind);
@@ -300,12 +303,6 @@
 +static void *get_dyn_sym(void *h, const char *name)
 +{
 +    return h ? dlsym(h, name) : NULL;
-+}
-+
-+static void close_dyn_lib(void *h)
-+{
-+    if (h)
-+        dlclose(h);
 +}
 +
 +static uint64_t ascend_thread_id(void)
@@ -438,23 +435,50 @@
 +    pthread_mutex_unlock(&ctx->lock);
 +}
 +
-+static int ascend_ensure_stage_buf(AscendDecodeContext *ctx, size_t need_size)
++static void ascend_host_buf_free(void *opaque, uint8_t *data)
 +{
-+    if (ctx->host_stage_buf && ctx->host_stage_size >= need_size)
++    aclError (*free_host)(void *) = opaque;
++    if (data && free_host)
++        free_host(data);
++}
++
++static AVBufferRef *ascend_host_pool_alloc(void *opaque, size_t size)
++{
++    AscendDecodeContext *ctx = opaque;
++    void *ptr = NULL;
++    AVBufferRef *ref;
++
++    if (ctx->context && ctx->aclrtSetCurrentContext)
++        ctx->aclrtSetCurrentContext(ctx->context);
++    if (ctx->aclrtMallocHost(&ptr, size) != ACL_SUCCESS || !ptr)
++        return NULL;
++    ref = av_buffer_create((uint8_t *)ptr, size, ascend_host_buf_free,
++                           ctx->aclrtFreeHost, 0);
++    if (!ref) {
++        ctx->aclrtFreeHost(ptr);
++        return NULL;
++    }
++    return ref;
++}
++
++static int ascend_ensure_host_pool(AscendDecodeContext *ctx, size_t need_size)
++{
++    if (ctx->host_frame_pool && ctx->host_frame_size >= need_size)
 +        return 0;
-+    av_freep(&ctx->host_stage_buf);
-+    ctx->host_stage_size = 0;
-+    ctx->host_stage_buf = av_malloc(need_size);
-+    if (!ctx->host_stage_buf)
++    av_buffer_pool_uninit(&ctx->host_frame_pool);
++    ctx->host_frame_size = 0;
++    ctx->host_frame_pool = av_buffer_pool_init2(need_size, ctx,
++                                                ascend_host_pool_alloc, NULL);
++    if (!ctx->host_frame_pool)
 +        return AVERROR(ENOMEM);
-+    ctx->host_stage_size = need_size;
++    ctx->host_frame_size = need_size;
 +    return 0;
 +}
 +
-+static void ascend_free_stage_buf(AscendDecodeContext *ctx)
++static void ascend_free_host_pool(AscendDecodeContext *ctx)
 +{
-+    av_freep(&ctx->host_stage_buf);
-+    ctx->host_stage_size = 0;
++    av_buffer_pool_uninit(&ctx->host_frame_pool);
++    ctx->host_frame_size = 0;
 +}
 +
 +static void queue_clear_locked(AscendDecodeContext *ctx)
@@ -596,6 +620,8 @@
 +    LOAD_SYM(aclrtDestroyContext, acl);
 +    LOAD_SYM(aclrtSetCurrentContext, acl);
 +    LOAD_SYM(aclrtProcessReport, acl);
++    LOAD_SYM(aclrtMallocHost, acl);
++    LOAD_SYM(aclrtFreeHost, acl);
 +    LOAD_SYM(aclrtMemcpy, acl);
 +    LOAD_OPT_SYM(aclrtMemcpy2d, acl);
 +
@@ -761,7 +787,7 @@
 +        ascend_destroy_channel(ctx);
 +        queue_clear(ctx);
 +        out_pool_clear(ctx);
-+        ascend_free_stage_buf(ctx);
++        ascend_free_host_pool(ctx);
 +        atomic_store(&ctx->in_flight, 0);
 +        ctx->eof_reached = ctx->eos_sent = ctx->eos_done = 0;
 +    }
@@ -1043,13 +1069,6 @@
 +        pthread_mutex_unlock(&ctx->lock);
 +    }
 +
-+    ret = ff_get_buffer(avctx, frame, 0);
-+    if (ret < 0)
-+        goto fail_pic;
-+
-+    frame->pts = item.pts;
-+    frame->pkt_dts = item.dts;
-+
 +    {
 +        void *dev = ctx->acldvppGetPicDescData(item.pic);
 +        uint32_t desc_w = ctx->acldvppGetPicDescWidth(item.pic);
@@ -1058,8 +1077,8 @@
 +        uint32_t stride_h = ctx->acldvppGetPicDescHeightStride(item.pic);
 +        int width = desc_w ? FFMIN(avctx->width, (int)desc_w) : avctx->width;
 +        int height = desc_h ? FFMIN(avctx->height, (int)desc_h) : avctx->height;
-+        int copy_w_y, copy_w_uv, chroma_h;
-+        size_t y_size, uv_size;
++        int chroma_h;
++        size_t y_size, uv_size, copy_size;
 +
 +        if (!dev || !stride_w || !stride_h || width <= 0 || height <= 0 ||
 +            stride_w < (uint32_t)width || stride_h < (uint32_t)height) {
@@ -1072,63 +1091,39 @@
 +        y_size = (size_t)stride_w * stride_h;
 +        chroma_h = (height + 1) / 2;
 +        uv_size = (size_t)stride_w * chroma_h;
-+        copy_w_y = FFMIN(width, frame->linesize[0]);
-+        copy_w_uv = FFMIN(width, frame->linesize[1]);
++        copy_size = y_size + uv_size;
 +
-+        if (frame->linesize[0] == (int)stride_w && copy_w_y == (int)stride_w &&
-+            frame->linesize[1] == (int)stride_w && copy_w_uv == (int)stride_w) {
-+            /*
-+             * Fast path (e.g. 1920-wide 1080p, 1280-wide 720p, 3840-wide 4K):
-+             * destination linesize matches VDEC stride_w, so DMA directly into
-+             * frame->data with zero intermediate staging and zero CPU memcpy.
-+             */
-+            size_t y_copy_bytes = (size_t)stride_w * height;
-+            if (stride_h == (uint32_t)height &&
-+                frame->data[1] == frame->data[0] + y_size) {
-+                if (ctx->aclrtMemcpy(frame->data[0], y_size + uv_size,
-+                                     dev, y_size + uv_size,
-+                                     ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
-+                    ret = AVERROR_EXTERNAL;
-+                    goto fail_pic;
-+                }
-+            } else {
-+                if (ctx->aclrtMemcpy(frame->data[0], y_copy_bytes,
-+                                     dev, y_copy_bytes,
-+                                     ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS ||
-+                    ctx->aclrtMemcpy(frame->data[1], uv_size,
-+                                     (const uint8_t *)dev + y_size, uv_size,
-+                                     ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
-+                    ret = AVERROR_EXTERNAL;
-+                    goto fail_pic;
-+                }
-+            }
-+            out_pool_put(ctx, dev);
-+        } else {
-+            /*
-+             * Stride mismatch fallback: 1D DMA into normal cacheable host
-+             * memory (av_malloc), then copy planes within CPU cache. Avoids
-+             * aclrtMallocHost non-cacheable (MT_NORMAL_NC) CPU read penalty on
-+             * Kunpeng aarch64.
-+             */
-+            ret = ascend_ensure_stage_buf(ctx, y_size + uv_size);
-+            if (ret < 0)
-+                goto fail_pic;
++        ret = ascend_ensure_host_pool(ctx, copy_size);
++        if (ret < 0)
++            goto fail_pic;
 +
-+            if (ctx->aclrtMemcpy(ctx->host_stage_buf, y_size + uv_size,
-+                                 dev, y_size + uv_size,
-+                                 ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
-+                ret = AVERROR_EXTERNAL;
-+                goto fail_pic;
-+            }
-+            out_pool_put(ctx, dev);
++        frame->width  = width;
++        frame->height = height;
++        frame->format = AV_PIX_FMT_NV12;
++        ret = ff_decode_frame_props(avctx, frame);
++        if (ret < 0)
++            goto fail_pic;
++        frame->pts     = item.pts;
++        frame->pkt_dts = item.dts;
 +
-+            av_image_copy_plane(frame->data[0], frame->linesize[0],
-+                                (const uint8_t *)ctx->host_stage_buf, stride_w,
-+                                copy_w_y, height);
-+            av_image_copy_plane(frame->data[1], frame->linesize[1],
-+                                (const uint8_t *)ctx->host_stage_buf + y_size,
-+                                stride_w, copy_w_uv, chroma_h);
++        frame->buf[0] = av_buffer_pool_get(ctx->host_frame_pool);
++        if (!frame->buf[0]) {
++            ret = AVERROR(ENOMEM);
++            goto fail_pic;
 +        }
++
++        if (ctx->aclrtMemcpy(frame->buf[0]->data, copy_size,
++                             dev, copy_size,
++                             ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
++            ret = AVERROR_EXTERNAL;
++            goto fail_pic;
++        }
++        out_pool_put(ctx, dev);
++
++        frame->data[0]     = frame->buf[0]->data;
++        frame->linesize[0] = (int)stride_w;
++        frame->data[1]     = frame->buf[0]->data + y_size;
++        frame->linesize[1] = (int)stride_w;
 +    }
 +    ctx->acldvppDestroyPicDesc(item.pic);
 +    return 0;
@@ -1331,14 +1326,14 @@
 +    queue_clear(ctx);
 +    out_pool_clear(ctx);
 +    in_pool_clear(ctx);
-+    ascend_free_stage_buf(ctx);
++    ascend_free_host_pool(ctx);
 +    av_packet_free(&ctx->pkt);
 +    atomic_store(&ctx->in_flight, 0);
 +    if (ctx->acl_acquired)
 +        ascend_global_release(ctx);
 +
-+    close_dyn_lib(ctx->dvpp_lib);
-+    close_dyn_lib(ctx->acl_lib);
++    /* Do not dlclose acl_lib/dvpp_lib so aclrtFreeHost remains valid if any
++     * downstream AVFrame outlives the decoder context. */
 +    ctx->dvpp_lib = ctx->acl_lib = NULL;
 +
 +    pthread_cond_destroy(&ctx->thread_started);
