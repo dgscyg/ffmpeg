@@ -88,7 +88,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1345 @@
+@@ -0,0 +1,1369 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 decoder.
 + *
@@ -216,8 +216,6 @@
 +    aclError (*aclrtDestroyContext)(aclrtContext);
 +    aclError (*aclrtSetCurrentContext)(aclrtContext);
 +    aclError (*aclrtProcessReport)(int32_t);
-+    aclError (*aclrtMallocHost)(void **, size_t);
-+    aclError (*aclrtFreeHost)(void *);
 +    aclError (*aclrtMemcpy)(void *, size_t, const void *, size_t, aclrtMemcpyKind);
 +    aclError (*aclrtMemcpy2d)(void *, size_t, const void *, size_t,
 +                              size_t, size_t, aclrtMemcpyKind);
@@ -444,25 +442,18 @@
 +{
 +    if (ctx->host_stage_buf && ctx->host_stage_size >= need_size)
 +        return 0;
-+    if (ctx->host_stage_buf) {
-+        ctx->aclrtFreeHost(ctx->host_stage_buf);
-+        ctx->host_stage_buf = NULL;
-+        ctx->host_stage_size = 0;
-+    }
-+    if (ctx->aclrtMallocHost(&ctx->host_stage_buf, need_size) != ACL_SUCCESS ||
-+        !ctx->host_stage_buf) {
-+        ctx->host_stage_buf = NULL;
++    av_freep(&ctx->host_stage_buf);
++    ctx->host_stage_size = 0;
++    ctx->host_stage_buf = av_malloc(need_size);
++    if (!ctx->host_stage_buf)
 +        return AVERROR(ENOMEM);
-+    }
 +    ctx->host_stage_size = need_size;
 +    return 0;
 +}
 +
 +static void ascend_free_stage_buf(AscendDecodeContext *ctx)
 +{
-+    if (ctx->host_stage_buf && ctx->aclrtFreeHost)
-+        ctx->aclrtFreeHost(ctx->host_stage_buf);
-+    ctx->host_stage_buf = NULL;
++    av_freep(&ctx->host_stage_buf);
 +    ctx->host_stage_size = 0;
 +}
 +
@@ -605,8 +596,6 @@
 +    LOAD_SYM(aclrtDestroyContext, acl);
 +    LOAD_SYM(aclrtSetCurrentContext, acl);
 +    LOAD_SYM(aclrtProcessReport, acl);
-+    LOAD_SYM(aclrtMallocHost, acl);
-+    LOAD_SYM(aclrtFreeHost, acl);
 +    LOAD_SYM(aclrtMemcpy, acl);
 +    LOAD_OPT_SYM(aclrtMemcpy2d, acl);
 +
@@ -1069,7 +1058,7 @@
 +        uint32_t stride_h = ctx->acldvppGetPicDescHeightStride(item.pic);
 +        int width = desc_w ? FFMIN(avctx->width, (int)desc_w) : avctx->width;
 +        int height = desc_h ? FFMIN(avctx->height, (int)desc_h) : avctx->height;
-+        int copy_w, chroma_h;
++        int copy_w_y, copy_w_uv, chroma_h;
 +        size_t y_size, uv_size;
 +
 +        if (!dev || !stride_w || !stride_h || width <= 0 || height <= 0 ||
@@ -1083,28 +1072,63 @@
 +        y_size = (size_t)stride_w * stride_h;
 +        chroma_h = (height + 1) / 2;
 +        uv_size = (size_t)stride_w * chroma_h;
++        copy_w_y = FFMIN(width, frame->linesize[0]);
++        copy_w_uv = FFMIN(width, frame->linesize[1]);
 +
-+        ret = ascend_ensure_stage_buf(ctx, y_size + uv_size);
-+        if (ret < 0)
-+            goto fail_pic;
++        if (frame->linesize[0] == (int)stride_w && copy_w_y == (int)stride_w &&
++            frame->linesize[1] == (int)stride_w && copy_w_uv == (int)stride_w) {
++            /*
++             * Fast path (e.g. 1920-wide 1080p, 1280-wide 720p, 3840-wide 4K):
++             * destination linesize matches VDEC stride_w, so DMA directly into
++             * frame->data with zero intermediate staging and zero CPU memcpy.
++             */
++            size_t y_copy_bytes = (size_t)stride_w * height;
++            if (stride_h == (uint32_t)height &&
++                frame->data[1] == frame->data[0] + y_size) {
++                if (ctx->aclrtMemcpy(frame->data[0], y_size + uv_size,
++                                     dev, y_size + uv_size,
++                                     ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
++                    ret = AVERROR_EXTERNAL;
++                    goto fail_pic;
++                }
++            } else {
++                if (ctx->aclrtMemcpy(frame->data[0], y_copy_bytes,
++                                     dev, y_copy_bytes,
++                                     ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS ||
++                    ctx->aclrtMemcpy(frame->data[1], uv_size,
++                                     (const uint8_t *)dev + y_size, uv_size,
++                                     ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
++                    ret = AVERROR_EXTERNAL;
++                    goto fail_pic;
++                }
++            }
++            out_pool_put(ctx, dev);
++        } else {
++            /*
++             * Stride mismatch fallback: 1D DMA into normal cacheable host
++             * memory (av_malloc), then copy planes within CPU cache. Avoids
++             * aclrtMallocHost non-cacheable (MT_NORMAL_NC) CPU read penalty on
++             * Kunpeng aarch64.
++             */
++            ret = ascend_ensure_stage_buf(ctx, y_size + uv_size);
++            if (ret < 0)
++                goto fail_pic;
 +
-+        if (ctx->aclrtMemcpy(ctx->host_stage_buf, y_size + uv_size,
-+                             dev, y_size + uv_size,
-+                             ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
-+            ret = AVERROR_EXTERNAL;
-+            goto fail_pic;
++            if (ctx->aclrtMemcpy(ctx->host_stage_buf, y_size + uv_size,
++                                 dev, y_size + uv_size,
++                                 ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
++                ret = AVERROR_EXTERNAL;
++                goto fail_pic;
++            }
++            out_pool_put(ctx, dev);
++
++            av_image_copy_plane(frame->data[0], frame->linesize[0],
++                                (const uint8_t *)ctx->host_stage_buf, stride_w,
++                                copy_w_y, height);
++            av_image_copy_plane(frame->data[1], frame->linesize[1],
++                                (const uint8_t *)ctx->host_stage_buf + y_size,
++                                stride_w, copy_w_uv, chroma_h);
 +        }
-+        out_pool_put(ctx, dev);
-+
-+        copy_w = FFMIN(width, frame->linesize[0]);
-+        av_image_copy_plane(frame->data[0], frame->linesize[0],
-+                            (const uint8_t *)ctx->host_stage_buf, stride_w,
-+                            copy_w, height);
-+
-+        copy_w = FFMIN(width, frame->linesize[1]);
-+        av_image_copy_plane(frame->data[1], frame->linesize[1],
-+                            (const uint8_t *)ctx->host_stage_buf + y_size,
-+                            stride_w, copy_w, chroma_h);
 +    }
 +    ctx->acldvppDestroyPicDesc(item.pic);
 +    return 0;
