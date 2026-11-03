@@ -102,7 +102,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1603 @@
+@@ -0,0 +1,1611 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 hardware decoder.
 + *
@@ -948,7 +948,10 @@
 +    AscendDecodeContext *ctx = avctx->priv_data;
 +    uint32_t stride_w = FFALIGN(coded_w, ASCEND_ALIGN_WIDTH);
 +    uint32_t stride_h = FFALIGN(coded_h, ASCEND_ALIGN_HEIGHT);
-+    aclError ret;
++    int start_ch = (ctx->channel_id >= 0 && ctx->channel_id < 256)
++                   ? ctx->channel_id : ((getpid() + atomic_fetch_add(&ascend_channel_counter, 1)) & 0xff);
++    int ch = start_ch;
++    aclError ret = ACL_ERROR_INVALID_PARAM;
 +
 +    ctx->channel_desc = ctx->aclvdecCreateChannelDesc();
 +    if (!ctx->channel_desc) {
@@ -956,8 +959,7 @@
 +        return AVERROR_EXTERNAL;
 +    }
 +
-+    ret  = ctx->aclvdecSetChannelDescChannelId(ctx->channel_desc, ctx->channel_id);
-+    ret |= ctx->aclvdecSetChannelDescThreadId(ctx->channel_desc, ctx->callback_tid);
++    ret  = ctx->aclvdecSetChannelDescThreadId(ctx->channel_desc, ctx->callback_tid);
 +    ret |= ctx->aclvdecSetChannelDescCallback(ctx->channel_desc, ascend_vdec_callback);
 +    ret |= ctx->aclvdecSetChannelDescEnType(ctx->channel_desc, map_en_type(avctx));
 +    ret |= ctx->aclvdecSetChannelDescOutPicFormat(ctx->channel_desc,
@@ -974,11 +976,21 @@
 +        return AVERROR_EXTERNAL;
 +    }
 +
-+    ret = ctx->aclvdecCreateChannel(ctx->channel_desc);
++    /* Auto-hunt available channel ID across [0..255] if specified channel is busy */
++    for (int attempt = 0; attempt < 256; attempt++) {
++        ctx->aclvdecSetChannelDescChannelId(ctx->channel_desc, (uint32_t)ch);
++        ret = ctx->aclvdecCreateChannel(ctx->channel_desc);
++        if (ret == ACL_SUCCESS) {
++            ctx->channel_id = ch;
++            break;
++        }
++        ch = (ch + 1) % 256;
++    }
++
 +    if (ret != ACL_SUCCESS) {
 +        av_log(avctx, AV_LOG_ERROR,
-+               "[Ascend] aclvdecCreateChannel(ch=%d, %dx%d) failed: 0x%x\n",
-+               ctx->channel_id, coded_w, coded_h, ret);
++               "[Ascend] aclvdecCreateChannel(ch=%d..%d, %dx%d) failed: 0x%x\n",
++               start_ch, (start_ch + 255) % 256, coded_w, coded_h, ret);
 +        ctx->aclvdecDestroyChannelDesc(ctx->channel_desc);
 +        ctx->channel_desc = NULL;
 +        return AVERROR_EXTERNAL;
@@ -1227,8 +1239,6 @@
 +    AscendDecodeContext *ctx = avctx->priv_data;
 +    AscendFrame item;
 +    int waited_ms = 0;
-+    int sent_pkt = 0;
-+    int poll_waited = 0;
 +    int ret;
 +
 +    if (!ctx->initialized)
@@ -1239,9 +1249,8 @@
 +            return AVERROR_EXTERNAL;
 +    }
 +
-+    /* Flow control / backpressure: stop draining if queue or in_flight is saturated */
++    /* Flow control / backpressure: drain packets as long as output queue is not clogged */
 +    while (!ctx->eof_reached &&
-+           atomic_load(&ctx->in_flight) < ASCEND_MAX_INFLIGHT &&
 +           ctx->queue_count < ASCEND_QUEUE_DEPTH / 2) {
 +        ret = ff_decode_get_packet(avctx, ctx->pkt);
 +        if (ret == AVERROR_EOF) {
@@ -1257,7 +1266,6 @@
 +        av_packet_unref(ctx->pkt);
 +        if (ret < 0)
 +            return ret;
-+        sent_pkt = 1;
 +    }
 +
 +    for (;;) {
@@ -1274,11 +1282,11 @@
 +            return AVERROR_EOF;
 +        }
 +        if (!ctx->eof_reached) {
-+            if (sent_pkt && !poll_waited && atomic_load(&ctx->in_flight) >= 8) {
++            /* If we have frames in flight and need an output frame, wait for callback */
++            if (atomic_load(&ctx->in_flight) > 0) {
 +                struct timespec ts;
-+                poll_waited = 1;
 +                clock_gettime(CLOCK_REALTIME, &ts);
-+                ts.tv_nsec += 5 * 1000000;
++                ts.tv_nsec += 10 * 1000000;
 +                if (ts.tv_nsec >= 1000000000) {
 +                    ts.tv_sec++;
 +                    ts.tv_nsec -= 1000000000;
@@ -3097,7 +3105,7 @@
  /**
 --- /dev/null
 +++ b/libavutil/hwcontext_ascend.c
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,605 @@
 +/*
 + * Huawei Ascend DVPP hardware context implementation.
 + *
@@ -3135,6 +3143,7 @@
 +
 +#include <dlfcn.h>
 +#include <pthread.h>
++#include <signal.h>
 +
 +typedef struct AscendGlobalSyms {
 +    void *acl_lib;
@@ -3259,6 +3268,13 @@
 +    pthread_mutex_unlock(&ascend_global_lock);
 +}
 +
++static void ascend_signal_handler(int sig)
++{
++    ascend_atexit_cleanup();
++    signal(sig, SIG_DFL);
++    raise(sig);
++}
++
 +int av_ascend_global_acquire(int device_id, void **out_acl_lib,
 +                             void **out_dvpp_lib, void **out_context,
 +                             void *log_ctx)
@@ -3279,7 +3295,15 @@
 +    }
 +
 +    if (!atexit_registered) {
++        struct sigaction sa;
 +        atexit(ascend_atexit_cleanup);
++        memset(&sa, 0, sizeof(sa));
++        sa.sa_handler = ascend_signal_handler;
++        sigemptyset(&sa.sa_mask);
++        sa.sa_flags = SA_RESETHAND;
++        sigaction(SIGINT, &sa, NULL);
++        sigaction(SIGTERM, &sa, NULL);
++        sigaction(SIGHUP, &sa, NULL);
 +        atexit_registered = 1;
 +    }
 +
