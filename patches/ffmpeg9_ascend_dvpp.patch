@@ -88,7 +88,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1153 @@
+@@ -0,0 +1,1170 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 decoder.
 + *
@@ -126,8 +126,7 @@
 +
 +#define ASCEND_ALIGN_WIDTH   128
 +#define ASCEND_ALIGN_HEIGHT  2
-+#define ASCEND_QUEUE_DEPTH   16
-+#define ASCEND_MAX_INFLIGHT  8
++#define ASCEND_QUEUE_DEPTH   64
 +#define ASCEND_VDEC_BUF_FULL 507018
 +
 +#ifndef _WIN32
@@ -375,10 +374,16 @@
 +        ctx->acldvppDestroyStreamDesc(input);
 +    }
 +
++    if (meta) {
++        atomic_fetch_sub(&ctx->in_flight, 1);
++        atomic_fetch_add(&ctx->cb_count, 1);
++    }
++
 +    if (output && ctx) {
 +        uint32_t ret_code = ctx->acldvppGetPicDescRetCode(output);
 +        if (!ret_code) {
-+            queue_push(ctx, output, meta->pts, meta->dts);
++            queue_push(ctx, output, meta ? meta->pts : AV_NOPTS_VALUE,
++                       meta ? meta->dts : AV_NOPTS_VALUE);
 +        } else {
 +            void *dev = ctx->acldvppGetPicDescData(output);
 +            if (dev)
@@ -391,8 +396,6 @@
 +    }
 +
 +    if (meta) {
-+        atomic_fetch_sub(&ctx->in_flight, 1);
-+        atomic_fetch_add(&ctx->cb_count, 1);
 +        pthread_mutex_lock(&ctx->lock);
 +        pthread_cond_broadcast(&ctx->cond);
 +        pthread_mutex_unlock(&ctx->lock);
@@ -706,6 +709,7 @@
 +{
 +    AscendDecodeContext *ctx = avctx->priv_data;
 +    acldvppStreamDesc *stream;
++    int attempts = 0;
 +    aclError ret;
 +
 +    if (!ctx->channel_desc) {
@@ -723,13 +727,20 @@
 +    }
 +
 +    /* CANN returns only after every queued frame callback has completed. */
-+    ret = ctx->aclvdecSendFrame(ctx->channel_desc, stream, NULL, NULL, NULL);
-+    ctx->acldvppDestroyStreamDesc(stream);
-+    if (ret != ACL_SUCCESS) {
++    for (;;) {
++        ret = ctx->aclvdecSendFrame(ctx->channel_desc, stream, NULL, NULL, NULL);
++        if (ret == ACL_SUCCESS)
++            break;
++        if ((int)ret == ASCEND_VDEC_BUF_FULL && attempts++ < 5000 &&
++            atomic_load(&ctx->running)) {
++            av_usleep(1000);
++            continue;
++        }
++        ctx->acldvppDestroyStreamDesc(stream);
 +        av_log(avctx, AV_LOG_ERROR, "[Ascend] EOS send failed: 0x%x\n", ret);
 +        return AVERROR_EXTERNAL;
 +    }
-+    ctx->eos_done = 1;
++    ctx->acldvppDestroyStreamDesc(stream);
 +    return 0;
 +}
 +
@@ -761,6 +772,8 @@
 +    AscendDecodeContext *ctx = avctx->priv_data;
 +    AscendFrame item;
 +    int waited_ms = 0;
++    int sent_pkt = 0;
++    int poll_waited = 0;
 +    int ret;
 +
 +    if (!ctx->initialized)
@@ -772,19 +785,19 @@
 +    }
 +
 +    /*
-+     * Packet fetching MUST happen before returning any frame.
++     * Drain all available input packets from avci->buffer_pkt / BSF first.
 +     *
-+     * avcodec_send_packet() stores the packet in avci->buffer_pkt and then
-+     * calls this function once. If we hand out a frame without consuming
-+     * that buffer, the next avcodec_send_packet() finds buffer_pkt occupied
-+     * and returns EAGAIN, which fftools reports as "Internal bug".
++     * avcodec_send_packet() stores the caller's packet in avci->buffer_pkt
++     * and invokes this callback once. Consuming until EAGAIN/EOF guarantees
++     * buffer_pkt is empty on return, while NOT returning early on EAGAIN
++     * allows subsequent avcodec_receive_frame() calls to drain queued frames.
 +     *
-+     * So: consume one input packet per call (unless draining), then hand out
-+     * whatever frame is available. AVERROR(EAGAIN) may only be propagated
-+     * when ff_decode_get_packet() itself returns it, because that is the one
-+     * case in which buffer_pkt is guaranteed empty.
++     * Do NOT gate sending on in_flight: VDEC's default display-order mode
++     * holds 8+ frames in its DPB reorder buffer that only come out when new
++     * packets or an EOS marker are fed in. Hardware backpressure is handled
++     * by aclvdecSendFrame() == 507018 retries in ascend_send_packet().
 +     */
-+    if (!ctx->eof_reached) {
++    while (!ctx->eof_reached) {
 +        AVPacket *pkt = av_packet_alloc();
 +        if (!pkt)
 +            return AVERROR(ENOMEM);
@@ -792,48 +805,21 @@
 +        if (ret == AVERROR_EOF) {
 +            av_packet_free(&pkt);
 +            ctx->eof_reached = 1;
++            break;
++        } else if (ret == AVERROR(EAGAIN)) {
++            av_packet_free(&pkt);
++            break;
 +        } else if (ret < 0) {
 +            av_packet_free(&pkt);
 +            return ret;
-+        } else {
-+            /* buffer_pkt is now empty; wait for hardware room, not EAGAIN. */
-+            while (atomic_load(&ctx->in_flight) >= ASCEND_MAX_INFLIGHT) {
-+                struct timespec ts;
-+                pthread_mutex_lock(&ctx->lock);
-+                clock_gettime(CLOCK_REALTIME, &ts);
-+                ts.tv_nsec += 10 * 1000000;
-+                if (ts.tv_nsec >= 1000000000) {
-+                    ts.tv_sec++;
-+                    ts.tv_nsec -= 1000000000;
-+                }
-+                pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
-+                pthread_mutex_unlock(&ctx->lock);
-+
-+                waited_ms += 10;
-+                if (waited_ms >= 30000) {
-+                    av_log(avctx, AV_LOG_ERROR,
-+                           "[Ascend] VDEC stalled (in_flight=%d, callbacks=%d)\n",
-+                           atomic_load(&ctx->in_flight),
-+                           atomic_load(&ctx->cb_count));
-+                    av_packet_free(&pkt);
-+                    return AVERROR_EXTERNAL;
-+                }
-+            }
-+            ret = ascend_send_packet(avctx, pkt);
-+            av_packet_unref(pkt);
-+            av_packet_free(&pkt);
-+            if (ret < 0)
-+                return ret;
 +        }
-+    }
 +
-+    /* Drain phase: only start EOS once every queued frame is out. */
-+    if (ctx->eof_reached && !ctx->eos_sent &&
-+        !atomic_load(&ctx->in_flight) && !ctx->queue_count) {
-+        ctx->eos_sent = 1;
-+        ret = ascend_send_eos(avctx);
++        ret = ascend_send_packet(avctx, pkt);
++        av_packet_unref(pkt);
++        av_packet_free(&pkt);
 +        if (ret < 0)
 +            return ret;
++        sent_pkt = 1;
 +    }
 +
 +    for (;;) {
@@ -851,14 +837,43 @@
 +        }
 +        if (!ctx->eof_reached) {
 +            /*
-+             * Input consumed, but VDEC still buffers frames internally.
-+             * Wait briefly, then report EAGAIN so fftools sends the next
-+             * packet. buffer_pkt is empty at this point, so this is safe.
++             * Once the reorder buffer is primed (in_flight >= 8) and we just
++             * submitted a packet, wait briefly (up to 5ms) for the callback so
++             * decoding paces naturally with the NPU without blocking if VDEC
++             * needs more input for reordering.
 +             */
++            if (sent_pkt && !poll_waited && atomic_load(&ctx->in_flight) >= 8) {
++                struct timespec ts;
++                poll_waited = 1;
++                clock_gettime(CLOCK_REALTIME, &ts);
++                ts.tv_nsec += 5 * 1000000;
++                if (ts.tv_nsec >= 1000000000) {
++                    ts.tv_sec++;
++                    ts.tv_nsec -= 1000000000;
++                }
++                pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
++                if (ctx->queue_count > 0) {
++                    pthread_mutex_unlock(&ctx->lock);
++                    continue;
++                }
++            }
 +            pthread_mutex_unlock(&ctx->lock);
 +            return AVERROR(EAGAIN);
 +        }
-+        if (ctx->eos_sent && !atomic_load(&ctx->in_flight)) {
++        /*
++         * Drain phase: once already-queued frames have been delivered, send
++         * EOS immediately without waiting for in_flight == 0 (frames buffered
++         * inside VDEC are only flushed by the EOS marker itself).
++         */
++        if (!ctx->eos_sent) {
++            ctx->eos_sent = 1;
++            pthread_mutex_unlock(&ctx->lock);
++            ret = ascend_send_eos(avctx);
++            if (ret < 0)
++                return ret;
++            continue;
++        }
++        if (!atomic_load(&ctx->in_flight)) {
 +            ctx->eos_done = 1;
 +            pthread_mutex_unlock(&ctx->lock);
 +            return AVERROR_EOF;
@@ -866,22 +881,24 @@
 +        {
 +            struct timespec ts;
 +            clock_gettime(CLOCK_REALTIME, &ts);
-+            ts.tv_nsec += 100 * 1000000;
++            ts.tv_nsec += 50 * 1000000;
 +            if (ts.tv_nsec >= 1000000000) {
 +                ts.tv_sec++;
 +                ts.tv_nsec -= 1000000000;
 +            }
 +            pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
 +        }
-+        pthread_mutex_unlock(&ctx->lock);
-+
-+        waited_ms += 100;
-+        if (waited_ms >= 30000) {
-+            av_log(avctx, AV_LOG_ERROR,
-+                   "[Ascend] timeout draining VDEC (in_flight=%d, callbacks=%d)\n",
-+                   atomic_load(&ctx->in_flight), atomic_load(&ctx->cb_count));
-+            return AVERROR_EXTERNAL;
++        if (ctx->queue_count > 0) {
++            pthread_mutex_unlock(&ctx->lock);
++            continue;
 +        }
++        waited_ms += 50;
++        if (waited_ms >= 1000) {
++            ctx->eos_done = 1;
++            pthread_mutex_unlock(&ctx->lock);
++            return AVERROR_EOF;
++        }
++        pthread_mutex_unlock(&ctx->lock);
 +    }
 +
 +    ret = ff_get_buffer(avctx, frame, 0);
