@@ -102,7 +102,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1518 @@
+@@ -0,0 +1,1606 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 hardware decoder.
 + *
@@ -150,10 +150,11 @@
 +#define ASCEND_ALIGN_WIDTH   128
 +#define ASCEND_ALIGN_HEIGHT  2
 +#define ASCEND_QUEUE_DEPTH   64
-+#define ASCEND_MAX_INFLIGHT  32
-+#define ASCEND_OUT_POOL_SIZE (ASCEND_MAX_INFLIGHT + ASCEND_QUEUE_DEPTH + 16)
-+#define ASCEND_IN_POOL_SIZE  (ASCEND_MAX_INFLIGHT + 8)
-+#define ASCEND_IN_MIN_ALLOC  (256 * 1024)
++#define ASCEND_MAX_INFLIGHT  20
++#define ASCEND_MAX_OUT_BUFS  40
++#define ASCEND_OUT_POOL_SIZE 96
++#define ASCEND_IN_POOL_SIZE  (ASCEND_MAX_INFLIGHT + 12)
++#define ASCEND_IN_MIN_ALLOC  (512 * 1024)
 +#define ASCEND_VDEC_BUF_FULL 507018
 +
 +#ifndef _WIN32
@@ -190,10 +191,12 @@
 +typedef struct AscendOutPool {
 +    atomic_int refs;
 +    pthread_mutex_t lock;
++    pthread_cond_t cond;
 +    int closed;
 +    AscendContextRef *cref;
 +    void *bufs[ASCEND_OUT_POOL_SIZE];
 +    int count;
++    int allocated;
 +    size_t buf_size;
 +} AscendOutPool;
 +
@@ -332,6 +335,7 @@
 +        return NULL;
 +    atomic_init(&p->refs, 1);
 +    pthread_mutex_init(&p->lock, NULL);
++    pthread_cond_init(&p->cond, NULL);
 +    atomic_fetch_add(&cref->refs, 1);
 +    p->cref = cref;
 +    return p;
@@ -357,6 +361,7 @@
 +            if (p->bufs[i] && cref && cref->acldvppFree)
 +                cref->acldvppFree(p->bufs[i]);
 +        }
++        pthread_cond_destroy(&p->cond);
 +        pthread_mutex_destroy(&p->lock);
 +        av_free(p);
 +        ascend_cref_unref(cref);
@@ -370,9 +375,13 @@
 +    pthread_mutex_lock(&p->lock);
 +    if (!p->closed && p->count < ASCEND_OUT_POOL_SIZE) {
 +        p->bufs[p->count++] = dev;
++        pthread_cond_signal(&p->cond);
 +        pthread_mutex_unlock(&p->lock);
 +        return;
 +    }
++    if (p->allocated > 0)
++        p->allocated--;
++    pthread_cond_broadcast(&p->cond);
 +    pthread_mutex_unlock(&p->lock);
 +    if (p->cref && p->cref->acldvppFree) {
 +        if (p->cref->context && p->cref->aclrtSetCurrentContext)
@@ -384,6 +393,19 @@
 +static void out_pool_put(AscendDecodeContext *ctx, void *dev)
 +{
 +    out_pool_put_raw(ctx->out_pool, dev);
++}
++
++static int out_pool_at_cap(AscendDecodeContext *ctx)
++{
++    AscendOutPool *p = ctx->out_pool;
++    int at_cap = 0;
++
++    if (!p)
++        return 0;
++    pthread_mutex_lock(&p->lock);
++    at_cap = (p->count == 0 && p->allocated >= ASCEND_MAX_OUT_BUFS);
++    pthread_mutex_unlock(&p->lock);
++    return at_cap;
 +}
 +
 +static void out_pool_clear(AscendDecodeContext *ctx, int mark_closed)
@@ -398,10 +420,13 @@
 +        p->cref->aclrtSetCurrentContext(p->cref->context);
 +    while (p->count > 0) {
 +        void *dev = p->bufs[--p->count];
++        if (p->allocated > 0)
++            p->allocated--;
 +        if (dev && p->cref && p->cref->acldvppFree)
 +            p->cref->acldvppFree(dev);
 +    }
 +    p->buf_size = 0;
++    pthread_cond_broadcast(&p->cond);
 +    pthread_mutex_unlock(&p->lock);
 +}
 +
@@ -416,20 +441,44 @@
 +    if (p->buf_size != size) {
 +        while (p->count > 0) {
 +            void *old = p->bufs[--p->count];
++            if (p->allocated > 0)
++                p->allocated--;
 +            if (old && p->cref && p->cref->acldvppFree)
 +                p->cref->acldvppFree(old);
 +        }
 +        p->buf_size = size;
++    }
++    if (p->count == 0 && !p->closed && p->allocated >= ASCEND_MAX_OUT_BUFS &&
++        atomic_load(&ctx->running)) {
++        struct timespec ts;
++        clock_gettime(CLOCK_REALTIME, &ts);
++        ts.tv_nsec += 100 * 1000000L;
++        if (ts.tv_nsec >= 1000000000L) {
++            ts.tv_sec++;
++            ts.tv_nsec -= 1000000000L;
++        }
++        while (p->count == 0 && !p->closed &&
++               p->allocated >= ASCEND_MAX_OUT_BUFS &&
++               atomic_load(&ctx->running)) {
++            if (pthread_cond_timedwait(&p->cond, &p->lock, &ts) != 0)
++                break;
++        }
 +    }
 +    if (p->count > 0) {
 +        dev = p->bufs[--p->count];
 +        pthread_mutex_unlock(&p->lock);
 +        return dev;
 +    }
++    p->allocated++;
 +    pthread_mutex_unlock(&p->lock);
 +
-+    if (ctx->acldvppMalloc(&dev, size) != ACL_SUCCESS)
++    if (ctx->acldvppMalloc(&dev, size) != ACL_SUCCESS || !dev) {
++        pthread_mutex_lock(&p->lock);
++        if (p->allocated > 0)
++            p->allocated--;
++        pthread_mutex_unlock(&p->lock);
 +        return NULL;
++    }
 +    return dev;
 +}
 +
@@ -448,23 +497,24 @@
 +    size_t alloc_size;
 +
 +    pthread_mutex_lock(&ctx->lock);
-+    if (ctx->in_pool_count > 0) {
-+        AscendInBuf b = ctx->in_pool[--ctx->in_pool_count];
-+        pthread_mutex_unlock(&ctx->lock);
-+        if (b.cap >= need_size) {
-+            *out_ptr = b.ptr;
-+            *out_cap = b.cap;
++    for (int i = ctx->in_pool_count - 1; i >= 0; i--) {
++        if (ctx->in_pool[i].cap >= need_size) {
++            *out_ptr = ctx->in_pool[i].ptr;
++            *out_cap = ctx->in_pool[i].cap;
++            ctx->in_pool[i] = ctx->in_pool[--ctx->in_pool_count];
++            pthread_mutex_unlock(&ctx->lock);
 +            return 0;
 +        }
-+        stale_ptr = b.ptr;
-+    } else {
-+        pthread_mutex_unlock(&ctx->lock);
 +    }
++    if (ctx->in_pool_count > 0)
++        stale_ptr = ctx->in_pool[--ctx->in_pool_count].ptr;
++    pthread_mutex_unlock(&ctx->lock);
 +
 +    if (stale_ptr && ctx->acldvppFree)
 +        ctx->acldvppFree(stale_ptr);
 +
-+    alloc_size = FFMAX(need_size, (size_t)ASCEND_IN_MIN_ALLOC);
++    alloc_size = FFALIGN(FFMAX(need_size, (size_t)ASCEND_IN_MIN_ALLOC),
++                         (size_t)(256 * 1024));
 +    if (ctx->acldvppMalloc(out_ptr, alloc_size) != ACL_SUCCESS || !*out_ptr)
 +        return AVERROR(ENOMEM);
 +    *out_cap = alloc_size;
@@ -1159,6 +1209,44 @@
 +    }
 +
 +    while (!ctx->eof_reached) {
++        /*
++         * Enforce VDEC in_flight and zero-copy DVPP surface-pool backpressure:
++         * - When ready frames are already queued and either VDEC in_flight or
++         *   the device surface pool is at cap, deliver a queued frame first so
++         *   downstream threads drain and recycle surfaces without new mallocs.
++         * - When the output queue is empty and in_flight is at ASCEND_MAX_INFLIGHT,
++         *   wait on ctx->cond before pulling/submitting the next packet so we
++         *   never return EAGAIN with avci->buffer_pkt unconsumed.
++         */
++        pthread_mutex_lock(&ctx->lock);
++        if (ctx->queue_count > 0 &&
++            (atomic_load(&ctx->in_flight) >= ASCEND_MAX_INFLIGHT ||
++             (avctx->pix_fmt == AV_PIX_FMT_ASCEND && out_pool_at_cap(ctx)))) {
++            pthread_mutex_unlock(&ctx->lock);
++            break;
++        }
++        if (ctx->queue_count == 0 &&
++            atomic_load(&ctx->in_flight) >= ASCEND_MAX_INFLIGHT) {
++            int wait_loops = 0;
++            while (ctx->queue_count == 0 &&
++                   atomic_load(&ctx->in_flight) >= ASCEND_MAX_INFLIGHT &&
++                   atomic_load(&ctx->running) && wait_loops++ < 50) {
++                struct timespec ts;
++                clock_gettime(CLOCK_REALTIME, &ts);
++                ts.tv_nsec += 10 * 1000000L;
++                if (ts.tv_nsec >= 1000000000L) {
++                    ts.tv_sec++;
++                    ts.tv_nsec -= 1000000000L;
++                }
++                pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
++            }
++            if (ctx->queue_count > 0) {
++                pthread_mutex_unlock(&ctx->lock);
++                break;
++            }
++        }
++        pthread_mutex_unlock(&ctx->lock);
++
 +        ret = ff_decode_get_packet(avctx, ctx->pkt);
 +        if (ret == AVERROR_EOF) {
 +            ctx->eof_reached = 1;
@@ -1623,7 +1711,7 @@
 +};
 --- /dev/null
 +++ b/libavcodec/ascendenc.c
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,946 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 hardware encoder (h264_ascend / hevc_ascend).
 + *
@@ -1662,11 +1750,12 @@
 +#include <acl/acl.h>
 +#include <acl/ops/acl_dvpp.h>
 +
-+#define ASCEND_ENC_ALIGN_W    16
-+#define ASCEND_ENC_ALIGN_H    2
-+#define ASCEND_ENC_QUEUE_SZ   64
-+#define ASCEND_ENC_POOL_SZ    36
-+#define ASCEND_VENC_BUF_FULL  507018
++#define ASCEND_ENC_ALIGN_W      16
++#define ASCEND_ENC_ALIGN_H      2
++#define ASCEND_ENC_QUEUE_SZ     64
++#define ASCEND_ENC_MAX_INFLIGHT 14
++#define ASCEND_ENC_POOL_SZ      36
++#define ASCEND_VENC_BUF_FULL    507018
 +
 +#ifndef _WIN32
 +
@@ -1897,7 +1986,8 @@
 +                int copied = 0;
 +                memset(buf + ssize, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 +                if (ssize > ctx->out_stage_size && ctx->aclrtMallocHost) {
-+                    size_t alloc_sz = FFMAX((size_t)ssize, (size_t)(512 * 1024));
++                    size_t alloc_sz = FFALIGN(FFMAX((size_t)ssize, (size_t)(512 * 1024)),
++                                              (size_t)(256 * 1024));
 +                    void *new_stage = NULL;
 +                    if (ctx->aclrtMallocHost(&new_stage, alloc_sz) == ACL_SUCCESS &&
 +                        new_stage) {
@@ -2294,6 +2384,34 @@
 +        ctx->aclrtSetCurrentContext(ctx->context);
 +
 +    while (!ctx->eof_sent) {
++        pthread_mutex_lock(&ctx->lock);
++        if (ctx->queue_count > 0 &&
++            atomic_load(&ctx->in_flight) >= ASCEND_ENC_MAX_INFLIGHT) {
++            pthread_mutex_unlock(&ctx->lock);
++            break;
++        }
++        if (ctx->queue_count == 0 &&
++            atomic_load(&ctx->in_flight) >= ASCEND_ENC_MAX_INFLIGHT) {
++            int wait_loops = 0;
++            while (ctx->queue_count == 0 &&
++                   atomic_load(&ctx->in_flight) >= ASCEND_ENC_MAX_INFLIGHT &&
++                   atomic_load(&ctx->running) && wait_loops++ < 50) {
++                struct timespec ts;
++                clock_gettime(CLOCK_REALTIME, &ts);
++                ts.tv_nsec += 10 * 1000000L;
++                if (ts.tv_nsec >= 1000000000L) {
++                    ts.tv_sec++;
++                    ts.tv_nsec -= 1000000000L;
++                }
++                pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
++            }
++            if (ctx->queue_count > 0) {
++                pthread_mutex_unlock(&ctx->lock);
++                break;
++            }
++        }
++        pthread_mutex_unlock(&ctx->lock);
++
 +        ret = ff_encode_get_frame(avctx, ctx->frame);
 +        if (ret == AVERROR_EOF) {
 +            ctx->eof_sent = 1;
@@ -3015,7 +3133,7 @@
  /**
 --- /dev/null
 +++ b/libavutil/hwcontext_ascend.c
-@@ -0,0 +1,630 @@
+@@ -0,0 +1,638 @@
 +/*
 + * Huawei Ascend DVPP hardware context implementation.
 + *
@@ -3394,9 +3512,17 @@
 +
 +static void ascend_dvpp_buf_free(void *opaque, uint8_t *data)
 +{
-+    aclError (*free_fn)(void *) = opaque;
-+    if (data && free_fn)
-+        free_fn(data);
++    int device_id = (int)(intptr_t)opaque;
++    if (!data)
++        return;
++    pthread_mutex_lock(&ascend_global_lock);
++    if (device_id >= 0 && device_id < (int)FF_ARRAY_ELEMS(ascend_device_refs) &&
++        ascend_device_refs[device_id] > 0 && ascend_syms.acldvppFree) {
++        if (ascend_device_contexts[device_id] && ascend_syms.aclrtSetCurrentContext)
++            ascend_syms.aclrtSetCurrentContext(ascend_device_contexts[device_id]);
++        ascend_syms.acldvppFree(data);
++    }
++    pthread_mutex_unlock(&ascend_global_lock);
 +}
 +
 +static AVBufferRef *ascend_frames_pool_alloc(void *opaque, size_t size)
@@ -3413,7 +3539,7 @@
 +        return NULL;
 +
 +    ref = av_buffer_create((uint8_t *)dev, size, ascend_dvpp_buf_free,
-+                           ascend_syms.acldvppFree, 0);
++                           (void *)(intptr_t)hwctx->device_id, 0);
 +    if (!ref) {
 +        ascend_syms.acldvppFree(dev);
 +        return NULL;
