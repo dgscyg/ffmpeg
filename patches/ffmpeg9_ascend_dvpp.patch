@@ -636,7 +636,7 @@
 +    pthread_mutex_unlock(&ctx->lock);
 +
 +    while (atomic_load(&ctx->running))
-+        ctx->aclrtProcessReport(10);
++        ctx->aclrtProcessReport(100);
 +
 +    return NULL;
 +}
@@ -851,17 +851,13 @@
 +}
 +
 +/*
-+ * 5-bit bijection on [0..31] that strictly alternates consecutive PIDs/streams
-+ * across [0..15] vs [16..31], across all four 8-channel banks, and across parity,
-+ * balancing multi-process VDEC load evenly across dual hardware cores with zero collisions.
++ * 8-bit Weyl bijection across [0..255] (odd stride 149: gcd(149,256)=1, gcd(149,12)=1,
++ * 149%4=1) so consecutive PIDs/streams distribute evenly across all VDEC hardware cores
++ * and channel banks on Ascend 310P (256 channels / 12 cores) with zero collisions.
 + */
-+static inline int ascend_perm32(unsigned k)
++static inline int ascend_perm256(unsigned k)
 +{
-+    return (int)(((k & 1u) << 4) |
-+                 (((k >> 1) & 1u) << 3) |
-+                 (k & 4u) |
-+                 (((k >> 3) & 1u) << 1) |
-+                 ((k ^ (k >> 4)) & 1u));
++    return (int)((k * 149u) & 0xffu);
 +}
 +
 +static int ascend_create_channel(AVCodecContext *avctx, int coded_w, int coded_h)
@@ -875,18 +871,13 @@
 +    int max_attempts = (user_ch >= 0) ? 257 : 256;
 +    aclError ret = ACL_ERROR_INVALID_PARAM;
 +
-+    /*
-+     * Pack [0..31] via balanced bijection first so <=32 concurrent decoders always
-+     * split evenly across physical VDEC cores, overflowing to [32..255] only if needed.
-+     */
 +    for (int attempt = 0; attempt < max_attempts; attempt++) {
 +        int ch;
 +        if (user_ch >= 0 && attempt == 0) {
 +            ch = user_ch;
 +        } else {
 +            int idx = (user_ch >= 0) ? (attempt - 1) : attempt;
-+            unsigned k = (base + (unsigned)idx) & 31u;
-+            ch = (idx & ~31) | ascend_perm32(k);
++            ch = ascend_perm256(base + (unsigned)idx);
 +            if (user_ch >= 0 && ch == user_ch)
 +                continue;
 +        }
@@ -897,8 +888,17 @@
 +            return AVERROR_EXTERNAL;
 +        }
 +
-+        ret  = ctx->aclvdecSetChannelDescChannelId(ctx->channel_desc, (uint32_t)ch);
-+        ret |= ctx->aclvdecSetChannelDescThreadId(ctx->channel_desc, ctx->callback_tid);
++        ret = ctx->aclvdecSetChannelDescChannelId(ctx->channel_desc, (uint32_t)ch);
++        if (ret != ACL_SUCCESS) {
++            ctx->aclvdecDestroyChannelDesc(ctx->channel_desc);
++            ctx->channel_desc = NULL;
++            if (ch >= 32)
++                continue;
++            av_log(avctx, AV_LOG_ERROR, "[Ascend] set channel id %d failed: 0x%x\n", ch, ret);
++            return AVERROR_EXTERNAL;
++        }
++
++        ret  = ctx->aclvdecSetChannelDescThreadId(ctx->channel_desc, ctx->callback_tid);
 +        ret |= ctx->aclvdecSetChannelDescCallback(ctx->channel_desc, ascend_vdec_callback);
 +        ret |= ctx->aclvdecSetChannelDescEnType(ctx->channel_desc, map_en_type(avctx));
 +        ret |= ctx->aclvdecSetChannelDescOutPicFormat(ctx->channel_desc,
@@ -1873,7 +1873,7 @@
 +    pthread_mutex_unlock(&ctx->lock);
 +
 +    while (atomic_load(&ctx->running))
-+        ctx->aclrtProcessReport(10);
++        ctx->aclrtProcessReport(100);
 +
 +    return NULL;
 +}
@@ -3025,7 +3025,7 @@
  /**
 --- /dev/null
 +++ b/libavutil/hwcontext_ascend.c
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,616 @@
 +/*
 + * Huawei Ascend DVPP hardware context implementation.
 + *
@@ -3093,7 +3093,7 @@
 +
 +static void *load_dyn_lib(const char *name)
 +{
-+    void *h = dlopen(name, RTLD_LAZY | RTLD_GLOBAL);
++    void *h = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
 +    const char *paths[] = {
 +        "/usr/local/Ascend/ascend-toolkit/latest/lib64",
 +        "/usr/local/Ascend/ascend-toolkit/latest/runtime/lib64",
@@ -3108,7 +3108,7 @@
 +        return h;
 +    for (int i = 0; paths[i]; i++) {
 +        snprintf(buf, sizeof(buf), "%s/%s", paths[i], name);
-+        h = dlopen(buf, RTLD_LAZY | RTLD_GLOBAL);
++        h = dlopen(buf, RTLD_NOW | RTLD_GLOBAL);
 +        if (h)
 +            return h;
 +    }
@@ -3119,10 +3119,6 @@
 +{
 +    if (ascend_syms.acl_lib && ascend_syms.dvpp_lib)
 +        return 0;
-+
-+    /* Default CANN logging to quiet error-only unless explicitly overridden by user */
-+    setenv("ASCEND_GLOBAL_LOG_LEVEL", "3", 0);
-+    setenv("ASCEND_SLOG_PRINT_TO_STDOUT", "0", 0);
 +
 +    if (!ascend_syms.acl_lib)
 +        ascend_syms.acl_lib = load_dyn_lib("libascendcl.so");
