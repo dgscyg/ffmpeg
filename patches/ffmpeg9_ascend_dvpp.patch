@@ -1,6 +1,6 @@
 --- a/configure
 +++ b/configure
-@@ -362,6 +362,7 @@
+@@ -362,6 +362,7 @@ External library support:
    --enable-mmal            enable Broadcom Multi-Media Abstraction Layer (Raspberry Pi) via MMAL [no]
    --disable-nvdec          disable Nvidia video decoding acceleration (via hwaccel) [autodetect]
    --disable-nvenc          disable Nvidia video encoding code [autodetect]
@@ -8,7 +8,7 @@
    --enable-rkmpp           enable Rockchip Media Process Platform code [no]
    --disable-v4l2-m2m       disable V4L2 mem2mem code [autodetect]
    --disable-vaapi          disable Video Acceleration API (mainly Unix/Intel) code [autodetect]
-@@ -2196,6 +2197,7 @@
+@@ -2196,6 +2197,7 @@ HWACCEL_LIBRARY_NONFREE_LIST="
  
  HWACCEL_LIBRARY_LIST="
      $HWACCEL_LIBRARY_NONFREE_LIST
@@ -16,7 +16,7 @@
      libmfx
      libvpl
      mmal
-@@ -3644,6 +3646,9 @@
+@@ -3644,6 +3646,9 @@ h264_oh_decoder_select="h264_mp4toannexb_bsf"
  h264_oh_encoder_deps="ohcodec"
  h264_qsv_decoder_select="h264_mp4toannexb_bsf qsvdec"
  h264_qsv_encoder_select="atsc_a53 qsvenc"
@@ -26,7 +26,7 @@
  h264_rkmpp_decoder_deps="rkmpp"
  h264_rkmpp_decoder_select="h264_mp4toannexb_bsf"
  h264_rkmpp_encoder_deps="rkmpp"
-@@ -3669,6 +3674,9 @@
+@@ -3669,6 +3674,9 @@ hevc_oh_decoder_select="hevc_mp4toannexb_bsf"
  hevc_oh_encoder_deps="ohcodec"
  hevc_qsv_decoder_select="hevc_mp4toannexb_bsf qsvdec"
  hevc_qsv_encoder_select="hevcparse qsvenc"
@@ -36,7 +36,7 @@
  hevc_rkmpp_decoder_deps="rkmpp"
  hevc_rkmpp_decoder_select="hevc_mp4toannexb_bsf"
  hevc_rkmpp_encoder_deps="rkmpp"
-@@ -4301,6 +4309,7 @@
+@@ -4301,6 +4309,7 @@ zoompan_filter_deps="swscale"
  zscale_filter_deps="libzimg const_nan"
  scale_vaapi_filter_deps="vaapi"
  scale_vt_filter_deps="videotoolbox VTPixelTransferSessionCreate"
@@ -44,7 +44,7 @@
  scale_vulkan_filter_deps="vulkan spirv_compiler swscale"
  vpp_qsv_filter_deps="libmfx"
  vpp_qsv_filter_select="qsvvpp"
-@@ -4369,6 +4378,8 @@
+@@ -4369,6 +4378,8 @@ swscale_deps="avutil"
  swscale_suggest="libm stdatomic"
  shader_compression_suggest="zlib"
  
@@ -53,7 +53,7 @@
  avcodec_extralibs="pthreads_extralibs iconv_extralibs dxva2_extralibs liblcevc_dec_extralibs lcms2_extralibs"
  avfilter_extralibs="pthreads_extralibs"
  avutil_extralibs="d3d11va_extralibs d3d12va_extralibs mediacodec_extralibs nanosleep_extralibs pthreads_extralibs vaapi_drm_extralibs vaapi_x11_extralibs vaapi_win32_extralibs vdpau_x11_extralibs"
-@@ -7556,6 +7567,7 @@
+@@ -7556,6 +7567,7 @@ enabled openssl           && { { check_pkg_config openssl "openssl >= 3.0.0" ope
                                 check_lib openssl openssl/ssl.h DTLS_get_data_mtu -lssl -lcrypto -lws2_32 -lgdi32 ||
                                 die "ERROR: openssl (>= 1.1.1) not found"; }
  enabled pocketsphinx      && require_pkg_config pocketsphinx pocketsphinx pocketsphinx/pocketsphinx.h ps_init
@@ -63,7 +63,7 @@
                                   die "ERROR: rkmpp requires --enable-libdrm"; }
 --- a/libavcodec/Makefile
 +++ b/libavcodec/Makefile
-@@ -444,6 +444,8 @@
+@@ -444,6 +444,8 @@ OBJS-$(CONFIG_H264_OH_DECODER)         += ohcodec.o ohdec.o
  OBJS-$(CONFIG_H264_OH_ENCODER)         += ohcodec.o ohenc.o
  OBJS-$(CONFIG_H264_QSV_DECODER)        += qsvdec.o
  OBJS-$(CONFIG_H264_QSV_ENCODER)        += qsvenc_h264.o
@@ -72,7 +72,7 @@
  OBJS-$(CONFIG_H264_RKMPP_DECODER)      += rkmppdec.o
  OBJS-$(CONFIG_H264_RKMPP_ENCODER)      += rkmppenc.o
  OBJS-$(CONFIG_H264_VAAPI_ENCODER)      += vaapi_encode_h264.o h264_levels.o \
-@@ -474,6 +476,8 @@
+@@ -474,6 +476,8 @@ OBJS-$(CONFIG_HEVC_OH_DECODER)         += ohcodec.o ohdec.o
  OBJS-$(CONFIG_HEVC_OH_ENCODER)         += ohcodec.o ohenc.o
  OBJS-$(CONFIG_HEVC_QSV_DECODER)        += qsvdec.o
  OBJS-$(CONFIG_HEVC_QSV_ENCODER)        += qsvenc_hevc.o hevc/ps_enc.o
@@ -83,7 +83,7 @@
  OBJS-$(CONFIG_HEVC_VAAPI_ENCODER)      += vaapi_encode_h265.o h265_profile_level.o \
 --- a/libavcodec/allcodecs.c
 +++ b/libavcodec/allcodecs.c
-@@ -153,12 +153,16 @@
+@@ -153,12 +153,16 @@ extern const FFCodec ff_h264_mediacodec_decoder;
  extern const FFCodec ff_h264_mediacodec_encoder;
  extern const FFCodec ff_h264_mmal_decoder;
  extern const FFCodec ff_h264_qsv_decoder;
@@ -102,7 +102,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1528 @@
+@@ -0,0 +1,1518 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 hardware decoder.
 + *
@@ -184,8 +184,6 @@
 +    void *acl_lib;
 +    void *dvpp_lib;
 +    aclError (*aclrtSetCurrentContext)(aclrtContext);
-+    aclError (*aclrtMallocHost)(void **, size_t);
-+    aclError (*aclrtFreeHost)(void *);
 +    aclError (*acldvppFree)(void *);
 +} AscendContextRef;
 +
@@ -505,39 +503,31 @@
 +
 +static void ascend_host_buf_free(void *opaque, uint8_t *data)
 +{
-+    AscendContextRef *cref = opaque;
-+    if (data && cref && cref->aclrtFreeHost) {
-+        if (cref->context && cref->aclrtSetCurrentContext)
-+            cref->aclrtSetCurrentContext(cref->context);
-+        cref->aclrtFreeHost(data);
-+    }
-+}
-+
-+static void ascend_host_pool_unref(void *opaque)
-+{
-+    ascend_cref_unref((AscendContextRef *)opaque);
++    (void)opaque;
++    if (data)
++        av_ascend_free_host(data);
 +}
 +
 +static AVBufferRef *ascend_host_pool_alloc(void *opaque, size_t size)
 +{
-+    AscendContextRef *cref = opaque;
++    AscendDecodeContext *ctx = opaque;
 +    void *ptr = NULL;
 +    AVBufferRef *ref;
 +
-+    if (cref && cref->aclrtMallocHost) {
-+        if (cref->context && cref->aclrtSetCurrentContext)
-+            cref->aclrtSetCurrentContext(cref->context);
-+        if (cref->aclrtMallocHost(&ptr, size) == ACL_SUCCESS && ptr) {
++    if (ctx && ctx->aclrtMallocHost) {
++        if (ctx->context && ctx->aclrtSetCurrentContext)
++            ctx->aclrtSetCurrentContext(ctx->context);
++        if (ctx->aclrtMallocHost(&ptr, size) == ACL_SUCCESS && ptr) {
 +            ref = av_buffer_create((uint8_t *)ptr, size, ascend_host_buf_free,
-+                                   cref, 0);
++                                   NULL, 0);
 +            if (!ref) {
-+                cref->aclrtFreeHost(ptr);
++                ctx->aclrtFreeHost(ptr);
 +                return NULL;
 +            }
 +            return ref;
 +        }
-+        if (!cref->host_alloc_warned) {
-+            cref->host_alloc_warned = 1;
++        if (ctx->cref && !ctx->cref->host_alloc_warned) {
++            ctx->cref->host_alloc_warned = 1;
 +            av_log(NULL, AV_LOG_WARNING,
 +                   "[Ascend] aclrtMallocHost(%zu) failed, falling back to pageable host memory\n",
 +                   size);
@@ -552,16 +542,10 @@
 +        return 0;
 +    av_buffer_pool_uninit(&ctx->host_frame_pool);
 +    ctx->host_frame_size = 0;
-+    if (!ctx->cref)
-+        return AVERROR(EINVAL);
-+    atomic_fetch_add(&ctx->cref->refs, 1);
-+    ctx->host_frame_pool = av_buffer_pool_init2(need_size, ctx->cref,
-+                                                ascend_host_pool_alloc,
-+                                                ascend_host_pool_unref);
-+    if (!ctx->host_frame_pool) {
-+        ascend_cref_unref(ctx->cref);
++    ctx->host_frame_pool = av_buffer_pool_init2(need_size, ctx,
++                                                ascend_host_pool_alloc, NULL);
++    if (!ctx->host_frame_pool)
 +        return AVERROR(ENOMEM);
-+    }
 +    ctx->host_frame_size = need_size;
 +    return 0;
 +}
@@ -851,13 +835,18 @@
 +}
 +
 +/*
-+ * 8-bit Weyl bijection across [0..255] (odd stride 149: gcd(149,256)=1, gcd(149,12)=1,
-+ * 149%4=1) so consecutive PIDs/streams distribute evenly across all VDEC hardware cores
-+ * and channel banks on Ascend 310P (256 channels / 12 cores) with zero collisions.
++ * 5-bit bijection on [0..31] that strictly alternates consecutive PIDs/streams
++ * across [0..15] vs [16..31], across all four 8-channel banks, and across parity,
++ * mapping <=32 concurrent decoders 1:1 onto Ascend 310P3's 32 physical VDEC slots
++ * without virtual-channel thrashing, while overflowing to [32..255] when busy.
 + */
-+static inline int ascend_perm256(unsigned k)
++static inline int ascend_perm32(unsigned k)
 +{
-+    return (int)((k * 149u) & 0xffu);
++    return (int)(((k & 1u) << 4) |
++                 (((k >> 1) & 1u) << 3) |
++                 (k & 4u) |
++                 (((k >> 3) & 1u) << 1) |
++                 ((k ^ (k >> 4)) & 1u));
 +}
 +
 +static int ascend_create_channel(AVCodecContext *avctx, int coded_w, int coded_h)
@@ -877,7 +866,10 @@
 +            ch = user_ch;
 +        } else {
 +            int idx = (user_ch >= 0) ? (attempt - 1) : attempt;
-+            ch = ascend_perm256(base + (unsigned)idx);
++            if (idx < 32)
++                ch = ascend_perm32((base + (unsigned)idx) & 31u);
++            else
++                ch = 32 + (int)(((base + (unsigned)(idx - 32)) * 149u) % 224u);
 +            if (user_ch >= 0 && ch == user_ch)
 +                continue;
 +        }
@@ -1428,8 +1420,6 @@
 +        return ret;
 +    }
 +    cref->aclrtSetCurrentContext = (void *)get_dyn_sym(cref->acl_lib, "aclrtSetCurrentContext");
-+    cref->aclrtMallocHost        = (void *)get_dyn_sym(cref->acl_lib, "aclrtMallocHost");
-+    cref->aclrtFreeHost          = (void *)get_dyn_sym(cref->acl_lib, "aclrtFreeHost");
 +    cref->acldvppFree            = (void *)get_dyn_sym(cref->dvpp_lib, "acldvppFree");
 +
 +    ctx->cref         = cref;
@@ -2552,7 +2542,7 @@
 +};
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
-@@ -478,6 +478,7 @@
+@@ -478,6 +478,7 @@ OBJS-$(CONFIG_SCALE_CUDA_FILTER)             += vf_scale_cuda.o scale_eval.o sca
  OBJS-$(CONFIG_SCALE_QSV_FILTER)              += vf_vpp_qsv.o
  OBJS-$(CONFIG_SCALE_VAAPI_FILTER)            += vf_scale_vaapi.o scale_eval.o vaapi_vpp.o
  OBJS-$(CONFIG_SCALE_VT_FILTER)               += vf_scale_vt.o scale_eval.o
@@ -2562,7 +2552,7 @@
  OBJS-$(CONFIG_SCDET_FILTER)                  += vf_scdet.o
 --- a/libavfilter/allfilters.c
 +++ b/libavfilter/allfilters.c
-@@ -450,6 +450,7 @@
+@@ -450,6 +450,7 @@ extern const FFFilter ff_vf_scale_d3d12;
  extern const FFFilter ff_vf_scale_qsv;
  extern const FFFilter ff_vf_scale_vaapi;
  extern const FFFilter ff_vf_scale_vt;
@@ -2977,7 +2967,7 @@
 +};
 --- a/libavutil/Makefile
 +++ b/libavutil/Makefile
-@@ -52,6 +52,7 @@
+@@ -52,6 +52,7 @@ HEADERS = adler32.h                                                     \
            hwcontext_mediacodec.h                                        \
            hwcontext_opencl.h                                            \
            hwcontext_oh.h                                                \
@@ -2985,7 +2975,7 @@
            hwcontext_vaapi.h                                             \
            hwcontext_videotoolbox.h                                      \
            hwcontext_vdpau.h                                             \
-@@ -214,6 +215,7 @@
+@@ -214,6 +215,7 @@ OBJS-$(CONFIG_LIBDRM)                   += hwcontext_drm.o
  OBJS-$(CONFIG_MACOS_KPERF)              += macos_kperf.o
  OBJS-$(CONFIG_MEDIACODEC)               += hwcontext_mediacodec.o
  OBJS-$(CONFIG_OHCODEC)                  += hwcontext_oh.o
@@ -2995,17 +2985,17 @@
  OBJS-$(CONFIG_VAAPI)                    += hwcontext_vaapi.o
 --- a/libavutil/hwcontext.c
 +++ b/libavutil/hwcontext.c
-@@ -72,6 +72,9 @@
+@@ -71,6 +71,9 @@ static const HWContextType * const hw_table[] = {
+ #endif
  #if CONFIG_OHCODEC
      &ff_hwcontext_type_oh,
- #endif
++#endif
 +#if CONFIG_ASCEND
 +    &ff_hwcontext_type_ascend,
-+#endif
+ #endif
      NULL,
  };
- 
-@@ -90,6 +93,7 @@
+@@ -90,6 +93,7 @@ static const char *const hw_type_names[] = {
      [AV_HWDEVICE_TYPE_VULKAN] = "vulkan",
      [AV_HWDEVICE_TYPE_AMF] = "amf",
      [AV_HWDEVICE_TYPE_OHCODEC] = "ohcodec",
@@ -3015,7 +3005,7 @@
  typedef struct FFHWDeviceContext {
 --- a/libavutil/hwcontext.h
 +++ b/libavutil/hwcontext.h
-@@ -41,6 +41,7 @@
+@@ -41,6 +41,7 @@ enum AVHWDeviceType {
      AV_HWDEVICE_TYPE_AMF,
      /* OpenHarmony Codec device */
      AV_HWDEVICE_TYPE_OHCODEC,
@@ -3025,7 +3015,7 @@
  /**
 --- /dev/null
 +++ b/libavutil/hwcontext_ascend.c
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,630 @@
 +/*
 + * Huawei Ascend DVPP hardware context implementation.
 + *
@@ -3304,6 +3294,16 @@
 +                ascend_syms.aclFinalize();
 +        }
 +    }
++    pthread_mutex_unlock(&ascend_global_lock);
++}
++
++void av_ascend_free_host(void *ptr)
++{
++    if (!ptr)
++        return;
++    pthread_mutex_lock(&ascend_global_lock);
++    if (ascend_acl_refs > 0 && ascend_syms.aclrtFreeHost)
++        ascend_syms.aclrtFreeHost(ptr);
 +    pthread_mutex_unlock(&ascend_global_lock);
 +}
 +
@@ -3632,6 +3632,10 @@
 +{
 +}
 +
++void av_ascend_free_host(void *ptr)
++{
++}
++
 +const HWContextType ff_hwcontext_type_ascend = {
 +    .type = AV_HWDEVICE_TYPE_ASCEND,
 +    .name = "ascend",
@@ -3644,7 +3648,7 @@
 +#endif /* _WIN32 */
 --- /dev/null
 +++ b/libavutil/hwcontext_ascend.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,53 @@
 +/*
 + * Huawei Ascend DVPP hardware context definitions.
 + *
@@ -3691,10 +3695,16 @@
 + */
 +void av_ascend_global_release(int device_id, void *context);
 +
++/**
++ * Safely free pinned host memory allocated via aclrtMallocHost if the
++ * process-wide ACL runtime is still active; no-op after aclFinalize().
++ */
++void av_ascend_free_host(void *ptr);
++
 +#endif /* AVUTIL_HWCONTEXT_ASCEND_H */
 --- a/libavutil/hwcontext_internal.h
 +++ b/libavutil/hwcontext_internal.h
-@@ -165,5 +165,6 @@
+@@ -165,5 +165,6 @@ extern const HWContextType ff_hwcontext_type_mediacodec;
  extern const HWContextType ff_hwcontext_type_vulkan;
  extern const HWContextType ff_hwcontext_type_amf;
  extern const HWContextType ff_hwcontext_type_oh;
@@ -3703,7 +3713,7 @@
  #endif /* AVUTIL_HWCONTEXT_INTERNAL_H */
 --- a/libavutil/pixdesc.c
 +++ b/libavutil/pixdesc.c
-@@ -3267,6 +3267,10 @@
+@@ -3267,6 +3267,10 @@ static const AVPixFmtDescriptor av_pix_fmt_descriptors[AV_PIX_FMT_NB] = {
          .name = "ohcodec",
          .flags = AV_PIX_FMT_FLAG_HWACCEL,
      },
@@ -3716,7 +3726,7 @@
  static const char * const color_range_names[] = {
 --- a/libavutil/pixfmt.h
 +++ b/libavutil/pixfmt.h
-@@ -498,6 +498,7 @@
+@@ -498,6 +498,7 @@ enum AVPixelFormat {
      AV_PIX_FMT_GBRP12MSBLE,    ///< planar GBR 4:4:4 36bpp, lowest bits zero, little-endian
  
      AV_PIX_FMT_OHCODEC, /// hardware decoding through openharmony
