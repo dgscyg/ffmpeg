@@ -102,7 +102,7 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1471 @@
+@@ -0,0 +1,1528 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 hardware decoder.
 + *
@@ -179,10 +179,13 @@
 +typedef struct AscendContextRef {
 +    atomic_int refs;
 +    int device_id;
++    int host_alloc_warned;
 +    aclrtContext context;
 +    void *acl_lib;
 +    void *dvpp_lib;
 +    aclError (*aclrtSetCurrentContext)(aclrtContext);
++    aclError (*aclrtMallocHost)(void **, size_t);
++    aclError (*aclrtFreeHost)(void *);
 +    aclError (*acldvppFree)(void *);
 +} AscendContextRef;
 +
@@ -336,6 +339,14 @@
 +    return p;
 +}
 +
++static void ascend_cref_unref(AscendContextRef *cref)
++{
++    if (cref && atomic_fetch_sub(&cref->refs, 1) == 1) {
++        av_ascend_global_release(cref->device_id, cref->context);
++        av_free(cref);
++    }
++}
++
 +static void out_pool_unref(AscendOutPool *p)
 +{
 +    if (!p)
@@ -350,10 +361,7 @@
 +        }
 +        pthread_mutex_destroy(&p->lock);
 +        av_free(p);
-+        if (cref && atomic_fetch_sub(&cref->refs, 1) == 1) {
-+            av_ascend_global_release(cref->device_id, cref->context);
-+            av_free(cref);
-+        }
++        ascend_cref_unref(cref);
 +    }
 +}
 +
@@ -408,8 +416,6 @@
 +        return NULL;
 +    pthread_mutex_lock(&p->lock);
 +    if (p->buf_size != size) {
-+        if (p->cref && p->cref->context && p->cref->aclrtSetCurrentContext)
-+            p->cref->aclrtSetCurrentContext(p->cref->context);
 +        while (p->count > 0) {
 +            void *old = p->bufs[--p->count];
 +            if (old && p->cref && p->cref->acldvppFree)
@@ -424,8 +430,6 @@
 +    }
 +    pthread_mutex_unlock(&p->lock);
 +
-+    if (ctx->context && ctx->aclrtSetCurrentContext)
-+        ctx->aclrtSetCurrentContext(ctx->context);
 +    if (ctx->acldvppMalloc(&dev, size) != ACL_SUCCESS)
 +        return NULL;
 +    return dev;
@@ -501,27 +505,43 @@
 +
 +static void ascend_host_buf_free(void *opaque, uint8_t *data)
 +{
-+    aclError (*free_host)(void *) = opaque;
-+    if (data && free_host)
-+        free_host(data);
++    AscendContextRef *cref = opaque;
++    if (data && cref && cref->aclrtFreeHost) {
++        if (cref->context && cref->aclrtSetCurrentContext)
++            cref->aclrtSetCurrentContext(cref->context);
++        cref->aclrtFreeHost(data);
++    }
++}
++
++static void ascend_host_pool_unref(void *opaque)
++{
++    ascend_cref_unref((AscendContextRef *)opaque);
 +}
 +
 +static AVBufferRef *ascend_host_pool_alloc(void *opaque, size_t size)
 +{
-+    AscendDecodeContext *ctx = opaque;
++    AscendContextRef *cref = opaque;
 +    void *ptr = NULL;
 +    AVBufferRef *ref;
 +
-+    if (ctx->context && ctx->aclrtSetCurrentContext)
-+        ctx->aclrtSetCurrentContext(ctx->context);
-+    if (ctx->aclrtMallocHost(&ptr, size) == ACL_SUCCESS && ptr) {
-+        ref = av_buffer_create((uint8_t *)ptr, size, ascend_host_buf_free,
-+                               ctx->aclrtFreeHost, 0);
-+        if (!ref) {
-+            ctx->aclrtFreeHost(ptr);
-+            return NULL;
++    if (cref && cref->aclrtMallocHost) {
++        if (cref->context && cref->aclrtSetCurrentContext)
++            cref->aclrtSetCurrentContext(cref->context);
++        if (cref->aclrtMallocHost(&ptr, size) == ACL_SUCCESS && ptr) {
++            ref = av_buffer_create((uint8_t *)ptr, size, ascend_host_buf_free,
++                                   cref, 0);
++            if (!ref) {
++                cref->aclrtFreeHost(ptr);
++                return NULL;
++            }
++            return ref;
 +        }
-+        return ref;
++        if (!cref->host_alloc_warned) {
++            cref->host_alloc_warned = 1;
++            av_log(NULL, AV_LOG_WARNING,
++                   "[Ascend] aclrtMallocHost(%zu) failed, falling back to pageable host memory\n",
++                   size);
++        }
 +    }
 +    return av_buffer_alloc(size);
 +}
@@ -532,10 +552,16 @@
 +        return 0;
 +    av_buffer_pool_uninit(&ctx->host_frame_pool);
 +    ctx->host_frame_size = 0;
-+    ctx->host_frame_pool = av_buffer_pool_init2(need_size, ctx,
-+                                                ascend_host_pool_alloc, NULL);
-+    if (!ctx->host_frame_pool)
++    if (!ctx->cref)
++        return AVERROR(EINVAL);
++    atomic_fetch_add(&ctx->cref->refs, 1);
++    ctx->host_frame_pool = av_buffer_pool_init2(need_size, ctx->cref,
++                                                ascend_host_pool_alloc,
++                                                ascend_host_pool_unref);
++    if (!ctx->host_frame_pool) {
++        ascend_cref_unref(ctx->cref);
 +        return AVERROR(ENOMEM);
++    }
 +    ctx->host_frame_size = need_size;
 +    return 0;
 +}
@@ -610,7 +636,7 @@
 +    pthread_mutex_unlock(&ctx->lock);
 +
 +    while (atomic_load(&ctx->running))
-+        ctx->aclrtProcessReport(100);
++        ctx->aclrtProcessReport(10);
 +
 +    return NULL;
 +}
@@ -824,18 +850,47 @@
 +    return avctx->hw_frames_ctx ? 0 : AVERROR(ENOMEM);
 +}
 +
++/*
++ * 5-bit bijection on [0..31] that strictly alternates consecutive PIDs/streams
++ * across [0..15] vs [16..31], across all four 8-channel banks, and across parity,
++ * balancing multi-process VDEC load evenly across dual hardware cores with zero collisions.
++ */
++static inline int ascend_perm32(unsigned k)
++{
++    return (int)(((k & 1u) << 4) |
++                 (((k >> 1) & 1u) << 3) |
++                 (k & 4u) |
++                 (((k >> 3) & 1u) << 1) |
++                 ((k ^ (k >> 4)) & 1u));
++}
++
 +static int ascend_create_channel(AVCodecContext *avctx, int coded_w, int coded_h)
 +{
 +    AscendDecodeContext *ctx = avctx->priv_data;
 +    uint32_t stride_w = FFALIGN(coded_w, ASCEND_ALIGN_WIDTH);
 +    uint32_t stride_h = FFALIGN(coded_h, ASCEND_ALIGN_HEIGHT);
-+    int start_ch = (ctx->channel_id >= 0 && ctx->channel_id < 256)
-+                   ? ctx->channel_id : ((getpid() + atomic_fetch_add(&ascend_channel_counter, 1)) & 0xff);
-+    int ch = start_ch;
++    unsigned base = (unsigned)getpid() +
++                    (unsigned)atomic_fetch_add(&ascend_channel_counter, 1);
++    int user_ch = (ctx->channel_id >= 0 && ctx->channel_id < 256) ? ctx->channel_id : -1;
++    int max_attempts = (user_ch >= 0) ? 257 : 256;
 +    aclError ret = ACL_ERROR_INVALID_PARAM;
 +
-+    /* Auto-hunt available channel ID across [0..255] with a clean descriptor per attempt */
-+    for (int attempt = 0; attempt < 256; attempt++) {
++    /*
++     * Pack [0..31] via balanced bijection first so <=32 concurrent decoders always
++     * split evenly across physical VDEC cores, overflowing to [32..255] only if needed.
++     */
++    for (int attempt = 0; attempt < max_attempts; attempt++) {
++        int ch;
++        if (user_ch >= 0 && attempt == 0) {
++            ch = user_ch;
++        } else {
++            int idx = (user_ch >= 0) ? (attempt - 1) : attempt;
++            unsigned k = (base + (unsigned)idx) & 31u;
++            ch = (idx & ~31) | ascend_perm32(k);
++            if (user_ch >= 0 && ch == user_ch)
++                continue;
++        }
++
 +        ctx->channel_desc = ctx->aclvdecCreateChannelDesc();
 +        if (!ctx->channel_desc) {
 +            av_log(avctx, AV_LOG_ERROR, "[Ascend] aclvdecCreateChannelDesc failed\n");
@@ -867,13 +922,12 @@
 +        }
 +        ctx->aclvdecDestroyChannelDesc(ctx->channel_desc);
 +        ctx->channel_desc = NULL;
-+        ch = (ch + 1) % 256;
 +    }
 +
 +    if (ret != ACL_SUCCESS || !ctx->channel_desc) {
 +        av_log(avctx, AV_LOG_ERROR,
-+               "[Ascend] aclvdecCreateChannel(ch=%d..%d, %dx%d) failed: 0x%x\n",
-+               start_ch, (start_ch + 255) % 256, coded_w, coded_h, ret);
++               "[Ascend] aclvdecCreateChannel(%dx%d) failed across all channels: 0x%x\n",
++               coded_w, coded_h, ret);
 +        return AVERROR_EXTERNAL;
 +    }
 +
@@ -886,26 +940,27 @@
 +    return 0;
 +}
 +
-+static int ascend_ensure_channel(AVCodecContext *avctx)
++static int ascend_ensure_channel(AVCodecContext *avctx, int width, int height,
++                                 int coded_w, int coded_h)
 +{
 +    AscendDecodeContext *ctx = avctx->priv_data;
-+    int width, height, coded_w, coded_h;
 +    int ret;
 +
-+    get_dimensions(avctx, &width, &height, &coded_w, &coded_h);
-+    ret = ff_set_dimensions(avctx, width, height);
-+    if (ret < 0)
-+        return ret;
++    if (ctx->channel_desc &&
++        coded_w == ctx->channel_width && coded_h == ctx->channel_height)
++        return 0;
++
++    if (avctx->width <= 0 || avctx->height <= 0) {
++        ret = ff_set_dimensions(avctx, width, height);
++        if (ret < 0)
++            return ret;
++    }
 +
 +    if (avctx->pix_fmt == AV_PIX_FMT_ASCEND) {
 +        ret = ascend_ensure_hw_frames(avctx, width, height);
 +        if (ret < 0)
 +            return ret;
 +    }
-+
-+    if (ctx->channel_desc &&
-+        coded_w == ctx->channel_width && coded_h == ctx->channel_height)
-+        return 0;
 +
 +    if (ctx->channel_desc) {
 +        av_log(avctx, AV_LOG_WARNING,
@@ -958,11 +1013,8 @@
 +    int attempts = 0;
 +    int ret;
 +
-+    if (ctx->context && ctx->aclrtSetCurrentContext)
-+        ctx->aclrtSetCurrentContext(ctx->context);
-+
 +    get_dimensions(avctx, &width, &height, &coded_w, &coded_h);
-+    ret = ascend_ensure_channel(avctx);
++    ret = ascend_ensure_channel(avctx, width, height, coded_w, coded_h);
 +    if (ret < 0)
 +        return ret;
 +
@@ -1157,8 +1209,10 @@
 +                    ts.tv_nsec -= 1000000000;
 +                }
 +                pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
-+                pthread_mutex_unlock(&ctx->lock);
-+                continue;
++                if (ctx->queue_count > 0) {
++                    pthread_mutex_unlock(&ctx->lock);
++                    continue;
++                }
 +            }
 +            pthread_mutex_unlock(&ctx->lock);
 +            return AVERROR(EAGAIN);
@@ -1205,8 +1259,10 @@
 +        uint32_t desc_h = ctx->acldvppGetPicDescHeight(item.pic);
 +        uint32_t stride_w = ctx->acldvppGetPicDescWidthStride(item.pic);
 +        uint32_t stride_h = ctx->acldvppGetPicDescHeightStride(item.pic);
-+        int width = desc_w ? (int)desc_w : (avctx->width > 0 ? avctx->width : 1920);
-+        int height = desc_h ? (int)desc_h : (avctx->height > 0 ? avctx->height : 1080);
++        int width = desc_w ? (avctx->width > 0 ? FFMIN(avctx->width, (int)desc_w) : (int)desc_w)
++                           : (avctx->width > 0 ? avctx->width : 1920);
++        int height = desc_h ? (avctx->height > 0 ? FFMIN(avctx->height, (int)desc_h) : (int)desc_h)
++                            : (avctx->height > 0 ? avctx->height : 1080);
 +        int chroma_h;
 +        size_t y_size, uv_size, copy_size;
 +
@@ -1219,8 +1275,8 @@
 +            goto fail_pic;
 +        }
 +
-+        if (desc_w && desc_h && (avctx->width != (int)desc_w || avctx->height != (int)desc_h))
-+            ff_set_dimensions(avctx, desc_w, desc_h);
++        if (avctx->width <= 0 || avctx->height <= 0)
++            ff_set_dimensions(avctx, width, height);
 +
 +        y_size = (size_t)stride_w * stride_h;
 +        chroma_h = (height + 1) / 2;
@@ -1372,6 +1428,8 @@
 +        return ret;
 +    }
 +    cref->aclrtSetCurrentContext = (void *)get_dyn_sym(cref->acl_lib, "aclrtSetCurrentContext");
++    cref->aclrtMallocHost        = (void *)get_dyn_sym(cref->acl_lib, "aclrtMallocHost");
++    cref->aclrtFreeHost          = (void *)get_dyn_sym(cref->acl_lib, "aclrtFreeHost");
 +    cref->acldvppFree            = (void *)get_dyn_sym(cref->dvpp_lib, "acldvppFree");
 +
 +    ctx->cref         = cref;
@@ -1387,9 +1445,6 @@
 +    ctx->out_pool = out_pool_alloc(ctx->cref);
 +    if (!ctx->out_pool)
 +        return AVERROR(ENOMEM);
-+
-+    if (ctx->channel_id < 0)
-+        ctx->channel_id = (getpid() + atomic_fetch_add(&ascend_channel_counter, 1)) & 0xff;
 +
 +    atomic_store(&ctx->running, 1);
 +    ret = pthread_create(&ctx->callback_thread, NULL, ascend_callback_thread, ctx);
@@ -1423,9 +1478,14 @@
 +
 +    ctx->initialized = 1;
 +
-+    av_log(avctx, AV_LOG_INFO,
-+           "[Ascend] DVPP decoder initialized (device=%d, channel=%d, pix_fmt=%s)\n",
-+           ctx->device_id, ctx->channel_id, av_get_pix_fmt_name(avctx->pix_fmt));
++    if (ctx->channel_id >= 0)
++        av_log(avctx, AV_LOG_INFO,
++               "[Ascend] DVPP decoder initialized (device=%d, channel=%d, pix_fmt=%s)\n",
++               ctx->device_id, ctx->channel_id, av_get_pix_fmt_name(avctx->pix_fmt));
++    else
++        av_log(avctx, AV_LOG_INFO,
++               "[Ascend] DVPP decoder initialized (device=%d, channel=auto, pix_fmt=%s)\n",
++               ctx->device_id, av_get_pix_fmt_name(avctx->pix_fmt));
 +    return 0;
 +}
 +
@@ -1457,10 +1517,7 @@
 +        ctx->cref = NULL;
 +        ctx->context = NULL;
 +        ctx->acl_acquired = 0;
-+        if (atomic_fetch_sub(&cref->refs, 1) == 1) {
-+            av_ascend_global_release(cref->device_id, cref->context);
-+            av_free(cref);
-+        }
++        ascend_cref_unref(cref);
 +    }
 +    ctx->dvpp_lib = ctx->acl_lib = NULL;
 +
@@ -1576,7 +1633,7 @@
 +};
 --- /dev/null
 +++ b/libavcodec/ascendenc.c
-@@ -0,0 +1,889 @@
+@@ -0,0 +1,916 @@
 +/*
 + * Huawei Ascend DVPP H.264/H.265 hardware encoder (h264_ascend / hevc_ascend).
 + *
@@ -1686,6 +1743,8 @@
 +
 +    void *host_stage_buf;
 +    size_t host_stage_size;
++    void *out_stage_buf;
++    size_t out_stage_size;
 +
 +    /* libascendcl.so */
 +    aclError (*aclrtSetCurrentContext)(aclrtContext);
@@ -1814,7 +1873,7 @@
 +    pthread_mutex_unlock(&ctx->lock);
 +
 +    while (atomic_load(&ctx->running))
-+        ctx->aclrtProcessReport(100);
++        ctx->aclrtProcessReport(10);
 +
 +    return NULL;
 +}
@@ -1845,8 +1904,27 @@
 +        if (!rcode && sdata && ssize > 0) {
 +            uint8_t *buf = av_malloc(ssize + AV_INPUT_BUFFER_PADDING_SIZE);
 +            if (buf) {
++                int copied = 0;
 +                memset(buf + ssize, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-+                if (ctx->aclrtMemcpy(buf, ssize, sdata, ssize,
++                if (ssize > ctx->out_stage_size && ctx->aclrtMallocHost) {
++                    size_t alloc_sz = FFMAX((size_t)ssize, (size_t)(512 * 1024));
++                    void *new_stage = NULL;
++                    if (ctx->aclrtMallocHost(&new_stage, alloc_sz) == ACL_SUCCESS &&
++                        new_stage) {
++                        if (ctx->out_stage_buf && ctx->aclrtFreeHost)
++                            ctx->aclrtFreeHost(ctx->out_stage_buf);
++                        ctx->out_stage_buf  = new_stage;
++                        ctx->out_stage_size = alloc_sz;
++                    }
++                }
++                if (ctx->out_stage_buf && ctx->out_stage_size >= ssize &&
++                    ctx->aclrtMemcpy(ctx->out_stage_buf, ssize, sdata, ssize,
++                                     ACL_MEMCPY_DEVICE_TO_HOST) == ACL_SUCCESS) {
++                    memcpy(buf, ctx->out_stage_buf, ssize);
++                    copied = 1;
++                }
++                if (!copied &&
++                    ctx->aclrtMemcpy(buf, ssize, sdata, ssize,
 +                                     ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS)
 +                    memcpy(buf, sdata, ssize);
 +
@@ -2292,8 +2370,10 @@
 +                    ts.tv_nsec -= 1000000000L;
 +                }
 +                pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
-+                pthread_mutex_unlock(&ctx->lock);
-+                continue;
++                if (ctx->queue_count > 0) {
++                    pthread_mutex_unlock(&ctx->lock);
++                    continue;
++                }
 +            }
 +            pthread_mutex_unlock(&ctx->lock);
 +            return AVERROR(EAGAIN);
@@ -2352,6 +2432,10 @@
 +    }
 +    enc_queue_clear(ctx);
 +    enc_in_pool_clear(ctx);
++    if (ctx->out_stage_buf && ctx->aclrtFreeHost)
++        ctx->aclrtFreeHost(ctx->out_stage_buf);
++    ctx->out_stage_buf = NULL;
++    ctx->out_stage_size = 0;
 +    if (ctx->host_stage_buf && ctx->aclrtFreeHost)
 +        ctx->aclrtFreeHost(ctx->host_stage_buf);
 +    ctx->host_stage_buf = NULL;
@@ -2941,7 +3025,7 @@
  /**
 --- /dev/null
 +++ b/libavutil/hwcontext_ascend.c
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,620 @@
 +/*
 + * Huawei Ascend DVPP hardware context implementation.
 + *
@@ -3009,7 +3093,7 @@
 +
 +static void *load_dyn_lib(const char *name)
 +{
-+    void *h = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
++    void *h = dlopen(name, RTLD_LAZY | RTLD_GLOBAL);
 +    const char *paths[] = {
 +        "/usr/local/Ascend/ascend-toolkit/latest/lib64",
 +        "/usr/local/Ascend/ascend-toolkit/latest/runtime/lib64",
@@ -3024,7 +3108,7 @@
 +        return h;
 +    for (int i = 0; paths[i]; i++) {
 +        snprintf(buf, sizeof(buf), "%s/%s", paths[i], name);
-+        h = dlopen(buf, RTLD_NOW | RTLD_GLOBAL);
++        h = dlopen(buf, RTLD_LAZY | RTLD_GLOBAL);
 +        if (h)
 +            return h;
 +    }
@@ -3035,6 +3119,10 @@
 +{
 +    if (ascend_syms.acl_lib && ascend_syms.dvpp_lib)
 +        return 0;
++
++    /* Default CANN logging to quiet error-only unless explicitly overridden by user */
++    setenv("ASCEND_GLOBAL_LOG_LEVEL", "3", 0);
++    setenv("ASCEND_SLOG_PRINT_TO_STDOUT", "0", 0);
 +
 +    if (!ascend_syms.acl_lib)
 +        ascend_syms.acl_lib = load_dyn_lib("libascendcl.so");
