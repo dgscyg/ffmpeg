@@ -102,9 +102,13 @@
  extern const FFCodec ff_hevc_v4l2m2m_decoder;
 --- /dev/null
 +++ b/libavcodec/ascenddec.c
-@@ -0,0 +1,1606 @@
+@@ -0,0 +1,1624 @@
 +/*
-+ * Huawei Ascend DVPP H.264/H.265 hardware decoder.
++ * Huawei Ascend DVPP V2 (hi_mpi_vdec) H.264/H.265 hardware decoder.
++ *
++ * Uses CANN DVPP V2 MPI (libacl_dvpp_mpi.so) with 256 hardware VDEC channels,
++ * lifting the legacy V1 aclvdec 32-channel ceiling and drastically reducing
++ * per-channel DVPP Hugepages footprint for 100+ concurrent 2K/4K streams.
 + *
 + * Supports dual output modes:
 + *   1. Host Mode (AV_PIX_FMT_NV12, default):
@@ -141,21 +145,35 @@
 +#include "libavutil/pixfmt.h"
 +#include "libavutil/time.h"
 +
++#include <stddef.h>
 +#include <stdint.h>
++#include <stdio.h>
 +#include <string.h>
 +
 +#include <acl/acl.h>
 +#include <acl/ops/acl_dvpp.h>
 +
-+#define ASCEND_ALIGN_WIDTH   128
-+#define ASCEND_ALIGN_HEIGHT  2
-+#define ASCEND_QUEUE_DEPTH   64
-+#define ASCEND_MAX_INFLIGHT  20
-+#define ASCEND_MAX_OUT_BUFS  40
-+#define ASCEND_OUT_POOL_SIZE 96
-+#define ASCEND_IN_POOL_SIZE  (ASCEND_MAX_INFLIGHT + 12)
-+#define ASCEND_IN_MIN_ALLOC  (512 * 1024)
-+#define ASCEND_VDEC_BUF_FULL 507018
++#define ASCEND_ALIGN_WIDTH    16
++#define ASCEND_ALIGN_HEIGHT   2
++#define ASCEND_MAX_INFLIGHT   12
++#define ASCEND_ACTIVE_SLOTS   (ASCEND_MAX_INFLIGHT + 4)
++#define ASCEND_MAX_OUT_BUFS   16
++#define ASCEND_OUT_POOL_SIZE  32
++#define ASCEND_IN_POOL_SIZE   (ASCEND_MAX_INFLIGHT + 4)
++#define ASCEND_IN_MIN_ALLOC   (256 * 1024)
++
++/* CANN DVPP V2 MPI ABI constants (verified against CANN 9.2.1 hi_dvpp_vdec.h) */
++#define FF_HI_VDEC_MAX_CHN_NUM        256
++#define FF_HI_PT_H264                 96u
++#define FF_HI_PT_H265                 265u
++#define FF_HI_VDEC_SEND_MODE_FRAME    1u
++#define FF_HI_PIXEL_FORMAT_YUV_SP_420 1u
++
++#define FF_HI_ERR_SYS_EXIST           0xA0028004u
++#define FF_HI_ERR_VDEC_EXIST          0xA0058004u
++#define FF_HI_ERR_VDEC_BUF_EMPTY      0xA005800Eu
++#define FF_HI_ERR_VDEC_BUF_FULL       0xA005800Fu
++#define FF_HI_ERR_VDEC_BUSY           0xA0058012u
 +
 +#ifndef _WIN32
 +
@@ -165,6 +183,136 @@
 +#include <time.h>
 +#include <unistd.h>
 +
++typedef int32_t  ff_hi_s32;
++typedef uint32_t ff_hi_u32;
++typedef uint64_t ff_hi_u64;
++typedef int16_t  ff_hi_s16;
++typedef uint8_t  ff_hi_u8;
++typedef ff_hi_s32 ff_hi_vdec_chn;
++
++typedef struct ff_hi_vdec_video_attr {
++    ff_hi_u32 ref_frame_num;
++    ff_hi_u32 temporal_mvp_en;
++    ff_hi_u32 tmv_buf_size;
++} ff_hi_vdec_video_attr;
++
++typedef struct ff_hi_vdec_chn_attr {
++    ff_hi_u32 type;
++    ff_hi_u32 mode;
++    ff_hi_u32 pic_width;
++    ff_hi_u32 pic_height;
++    ff_hi_u32 stream_buf_size;
++    ff_hi_u32 frame_buf_size;
++    ff_hi_u32 frame_buf_cnt;
++    union {
++        ff_hi_vdec_video_attr video_attr;
++    };
++} ff_hi_vdec_chn_attr;
++
++typedef struct ff_hi_vdec_stream {
++    ff_hi_u32 end_of_frame;
++    ff_hi_u32 end_of_stream;
++    ff_hi_u32 need_display;
++    ff_hi_u32 _pad0;
++    ff_hi_u64 pts;
++    ff_hi_u64 private_data;
++    ff_hi_u32 len;
++    ff_hi_u32 _pad1;
++    ff_hi_u8 *addr;
++} ff_hi_vdec_stream;
++
++typedef struct ff_hi_vdec_pic_info {
++    ff_hi_u32 width;
++    ff_hi_u32 height;
++    ff_hi_u32 width_stride;
++    ff_hi_u32 height_stride;
++    ff_hi_u32 pixel_format;
++    ff_hi_u32 _pad0;
++    ff_hi_u64 vir_addr;
++    ff_hi_u32 buffer_size;
++    ff_hi_s16 offset_top;
++    ff_hi_s16 offset_bottom;
++    ff_hi_s16 offset_left;
++    ff_hi_s16 offset_right;
++    ff_hi_u32 _pad1;
++} ff_hi_vdec_pic_info;
++
++typedef struct ff_hi_video_frame {
++    ff_hi_u32 width;
++    ff_hi_u32 height;
++    ff_hi_u32 field;
++    ff_hi_u32 pixel_format;
++    ff_hi_u32 video_format;
++    ff_hi_u32 compress_mode;
++    ff_hi_u32 dynamic_range;
++    ff_hi_u32 color_gamut;
++
++    ff_hi_u32 header_stride[3];
++    ff_hi_u32 width_stride[3];
++    ff_hi_u32 height_stride[3];
++
++    ff_hi_u64 header_phys_addr[3];
++    ff_hi_u64 phys_addr[3];
++    void     *header_virt_addr[3];
++    void     *virt_addr[3];
++
++    ff_hi_u32 time_ref;
++    ff_hi_u64 pts;
++
++    ff_hi_u64 user_data[2];
++    ff_hi_u32 frame_flag;
++    ff_hi_u8  supplement[116];
++} ff_hi_video_frame;
++
++typedef struct ff_hi_video_frame_info {
++    ff_hi_video_frame v_frame;
++    ff_hi_u32         pool_id;
++    ff_hi_u32         mod_id;
++} ff_hi_video_frame_info;
++
++typedef struct ff_hi_vdec_supplement_info {
++    ff_hi_u32 data[4];
++} ff_hi_vdec_supplement_info;
++
++_Static_assert(sizeof(ff_hi_vdec_chn_attr) == 40, "hi_vdec_chn_attr ABI size");
++_Static_assert(sizeof(ff_hi_vdec_stream) == 48, "hi_vdec_stream ABI size");
++_Static_assert(offsetof(ff_hi_vdec_stream, pts) == 16, "hi_vdec_stream.pts ABI offset");
++_Static_assert(offsetof(ff_hi_vdec_stream, addr) == 40, "hi_vdec_stream.addr ABI offset");
++_Static_assert(sizeof(ff_hi_vdec_pic_info) == 48, "hi_vdec_pic_info ABI size");
++_Static_assert(offsetof(ff_hi_vdec_pic_info, vir_addr) == 24, "hi_vdec_pic_info.vir_addr ABI offset");
++_Static_assert(sizeof(ff_hi_video_frame) == 320, "hi_video_frame ABI size");
++_Static_assert(sizeof(ff_hi_video_frame_info) == 328, "hi_video_frame_info ABI size");
++_Static_assert(offsetof(ff_hi_video_frame, width_stride) == 44, "hi_video_frame.width_stride ABI offset");
++_Static_assert(offsetof(ff_hi_video_frame, height_stride) == 56, "hi_video_frame.height_stride ABI offset");
++_Static_assert(offsetof(ff_hi_video_frame, virt_addr) == 144, "hi_video_frame.virt_addr ABI offset");
++_Static_assert(offsetof(ff_hi_video_frame, pts) == 176, "hi_video_frame.pts ABI offset");
++_Static_assert(offsetof(ff_hi_video_frame, frame_flag) == 200, "hi_video_frame.frame_flag ABI offset");
++_Static_assert(sizeof(ff_hi_vdec_supplement_info) == 16, "hi_vdec_supplement_info ABI size");
++
++typedef struct AscendMpiSyms {
++    void *mpi_lib;
++    int sys_inited;
++    ff_hi_s32 (*hi_mpi_sys_init)(void);
++    ff_hi_s32 (*hi_mpi_dvpp_malloc)(ff_hi_u32 dev_id, void **dev_ptr, ff_hi_u64 size);
++    ff_hi_s32 (*hi_mpi_dvpp_free)(void *dev_ptr);
++    ff_hi_s32 (*hi_mpi_vdec_create_chn)(ff_hi_vdec_chn chn, const ff_hi_vdec_chn_attr *attr);
++    ff_hi_s32 (*hi_mpi_vdec_destroy_chn)(ff_hi_vdec_chn chn);
++    ff_hi_s32 (*hi_mpi_vdec_start_recv_stream)(ff_hi_vdec_chn chn);
++    ff_hi_s32 (*hi_mpi_vdec_stop_recv_stream)(ff_hi_vdec_chn chn);
++    ff_hi_s32 (*hi_mpi_vdec_reset_chn)(ff_hi_vdec_chn chn);
++    ff_hi_s32 (*hi_mpi_vdec_send_stream)(ff_hi_vdec_chn chn, const ff_hi_vdec_stream *stream,
++                                         ff_hi_vdec_pic_info *pic_info, ff_hi_s32 milli_sec);
++    ff_hi_s32 (*hi_mpi_vdec_get_frame)(ff_hi_vdec_chn chn, ff_hi_video_frame_info *frame_info,
++                                       ff_hi_vdec_supplement_info *supplement,
++                                       ff_hi_vdec_stream *stream, ff_hi_s32 milli_sec);
++    ff_hi_s32 (*hi_mpi_vdec_release_frame)(ff_hi_vdec_chn chn, const ff_hi_video_frame_info *frame_info);
++} AscendMpiSyms;
++
++static pthread_mutex_t ascend_v2_lock = PTHREAD_MUTEX_INITIALIZER;
++static AscendMpiSyms ascend_mpi;
++static uint64_t ascend_chn_bitmap[FF_HI_VDEC_MAX_CHN_NUM / 64];
++static uint32_t ascend_chn_cursor;
++
 +typedef struct AscendInBuf {
 +    void *ptr;
 +    size_t cap;
@@ -172,20 +320,16 @@
 +
 +/*
 + * Reference-counted Ascend device context holder.
-+ * Allows the decoder and downstream AscendOutPool instances to share the exact
-+ * same aclrtContext. When the decoder closes, downstream frames keeping AscendOutPool
-+ * alive continue to hold a reference to AscendContextRef so acldvppFree can safely run,
-+ * without creating a conflicting second context that breaks aclvdecSendFrame.
++ * Keeps the ACL context and hi_mpi_dvpp_free alive as long as downstream
++ * zero-copy AVFrames still reference an AscendOutPool.
 + */
 +typedef struct AscendContextRef {
 +    atomic_int refs;
 +    int device_id;
 +    int host_alloc_warned;
 +    aclrtContext context;
-+    void *acl_lib;
-+    void *dvpp_lib;
 +    aclError (*aclrtSetCurrentContext)(aclrtContext);
-+    aclError (*acldvppFree)(void *);
++    ff_hi_s32 (*hi_mpi_dvpp_free)(void *);
 +} AscendContextRef;
 +
 +typedef struct AscendOutPool {
@@ -193,6 +337,7 @@
 +    pthread_mutex_t lock;
 +    pthread_cond_t cond;
 +    int closed;
++    int max_bufs;
 +    AscendContextRef *cref;
 +    void *bufs[ASCEND_OUT_POOL_SIZE];
 +    int count;
@@ -200,56 +345,30 @@
 +    size_t buf_size;
 +} AscendOutPool;
 +
-+typedef struct AscendFrameMeta {
-+    struct AscendDecodeContext *ctx;
-+    size_t in_cap;
-+    int64_t pts;
-+    int64_t dts;
-+} AscendFrameMeta;
-+
-+typedef struct AscendFrame {
-+    acldvppPicDesc *pic;
-+    int64_t pts;
-+    int64_t dts;
-+} AscendFrame;
-+
 +typedef struct AscendDecodeContext {
 +    const AVClass *class;
 +
 +    void *acl_lib;
-+    void *dvpp_lib;
 +
 +    int device_id;
 +    int channel_id;
++    int active_chn;
++    int channel_created;
 +    int device_output;
++    int max_out_bufs;
 +    int codec_id;
 +    int initialized;
-+    int acl_acquired;
++    int extradata_sent;
 +
 +    AscendContextRef *cref;
 +    aclrtContext context;
-+    aclvdecChannelDesc *channel_desc;
 +    int channel_width;
 +    int channel_height;
 +
 +    AVBufferRef *hw_device_ref;
 +    AVBufferRef *hw_frames_ref;
 +
-+    pthread_t callback_thread;
-+    uint64_t callback_tid;
-+    pthread_mutex_t lock;
-+    pthread_cond_t cond;
-+    pthread_cond_t thread_started;
-+    int callback_thread_started;
-+    atomic_int running;
-+    atomic_int in_flight;
-+    atomic_int cb_count;
-+
-+    AscendFrame queue[ASCEND_QUEUE_DEPTH];
-+    int queue_head;
-+    int queue_tail;
-+    int queue_count;
-+
++    int in_flight;
 +    int eof_reached;
 +    int eos_sent;
 +    int eos_done;
@@ -263,69 +382,159 @@
 +    AscendInBuf in_pool[ASCEND_IN_POOL_SIZE];
 +    int in_pool_count;
 +
++    AscendInBuf in_active[ASCEND_ACTIVE_SLOTS];
++    int in_active_count;
++    void *out_active[ASCEND_ACTIVE_SLOTS];
++    int out_active_count;
++
 +    /* libascendcl.so */
 +    aclError (*aclrtSetCurrentContext)(aclrtContext);
-+    aclError (*aclrtProcessReport)(int32_t);
 +    aclError (*aclrtMallocHost)(void **, size_t);
 +    aclError (*aclrtFreeHost)(void *);
 +    aclError (*aclrtMemcpy)(void *, size_t, const void *, size_t, aclrtMemcpyKind);
-+
-+    /* libacl_dvpp.so */
-+    aclError (*acldvppMalloc)(void **, size_t);
-+    aclError (*acldvppFree)(void *);
-+
-+    aclvdecChannelDesc *(*aclvdecCreateChannelDesc)(void);
-+    aclError (*aclvdecDestroyChannelDesc)(aclvdecChannelDesc *);
-+    aclError (*aclvdecSetChannelDescChannelId)(aclvdecChannelDesc *, uint32_t);
-+    aclError (*aclvdecSetChannelDescThreadId)(aclvdecChannelDesc *, uint64_t);
-+    aclError (*aclvdecSetChannelDescCallback)(aclvdecChannelDesc *, aclvdecCallback);
-+    aclError (*aclvdecSetChannelDescEnType)(aclvdecChannelDesc *, acldvppStreamFormat);
-+    aclError (*aclvdecSetChannelDescOutPicFormat)(aclvdecChannelDesc *, acldvppPixelFormat);
-+    aclError (*aclvdecSetChannelDescOutPicWidth)(aclvdecChannelDesc *, uint32_t);
-+    aclError (*aclvdecSetChannelDescOutPicHeight)(aclvdecChannelDesc *, uint32_t);
-+    aclError (*aclvdecCreateChannel)(aclvdecChannelDesc *);
-+    aclError (*aclvdecDestroyChannel)(aclvdecChannelDesc *);
-+
-+    acldvppStreamDesc *(*acldvppCreateStreamDesc)(void);
-+    aclError (*acldvppDestroyStreamDesc)(acldvppStreamDesc *);
-+    aclError (*acldvppSetStreamDescData)(acldvppStreamDesc *, void *);
-+    aclError (*acldvppSetStreamDescSize)(acldvppStreamDesc *, uint32_t);
-+    aclError (*acldvppSetStreamDescEos)(acldvppStreamDesc *, uint8_t);
-+    void *(*acldvppGetStreamDescData)(const acldvppStreamDesc *);
-+
-+    acldvppPicDesc *(*acldvppCreatePicDesc)(void);
-+    aclError (*acldvppDestroyPicDesc)(acldvppPicDesc *);
-+    aclError (*acldvppSetPicDescData)(acldvppPicDesc *, void *);
-+    aclError (*acldvppSetPicDescSize)(acldvppPicDesc *, uint32_t);
-+    aclError (*acldvppSetPicDescFormat)(acldvppPicDesc *, acldvppPixelFormat);
-+    aclError (*acldvppSetPicDescWidth)(acldvppPicDesc *, uint32_t);
-+    aclError (*acldvppSetPicDescHeight)(acldvppPicDesc *, uint32_t);
-+    aclError (*acldvppSetPicDescWidthStride)(acldvppPicDesc *, uint32_t);
-+    aclError (*acldvppSetPicDescHeightStride)(acldvppPicDesc *, uint32_t);
-+    void *(*acldvppGetPicDescData)(const acldvppPicDesc *);
-+    uint32_t (*acldvppGetPicDescWidth)(const acldvppPicDesc *);
-+    uint32_t (*acldvppGetPicDescHeight)(const acldvppPicDesc *);
-+    uint32_t (*acldvppGetPicDescWidthStride)(const acldvppPicDesc *);
-+    uint32_t (*acldvppGetPicDescHeightStride)(const acldvppPicDesc *);
-+    uint32_t (*acldvppGetPicDescRetCode)(const acldvppPicDesc *);
-+
-+    aclError (*aclvdecSendFrame)(aclvdecChannelDesc *, acldvppStreamDesc *,
-+                                 acldvppPicDesc *, aclvdecFrameConfig *, void *);
 +} AscendDecodeContext;
-+
-+static atomic_int ascend_channel_counter;
 +
 +static void *get_dyn_sym(void *h, const char *name)
 +{
 +    return h ? dlsym(h, name) : NULL;
 +}
 +
-+static uint64_t ascend_thread_id(void)
++static void *load_mpi_lib(void)
 +{
-+    return (uint64_t)(uintptr_t)pthread_self();
++    void *h = dlopen("libacl_dvpp_mpi.so", RTLD_NOW | RTLD_GLOBAL);
++    const char *paths[] = {
++        "/usr/local/Ascend/ascend-toolkit/latest/lib64",
++        "/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64",
++        "/usr/local/Ascend/ascend-toolkit/latest/x86_64-linux/lib64",
++        "/usr/local/Ascend/ascend-toolkit/latest/runtime/lib64",
++        "/usr/local/Ascend/nnae/latest/lib64",
++        "/usr/local/Ascend/ascend-toolkit/lib64",
++        NULL
++    };
++    char buf[512];
++
++    if (h)
++        return h;
++    for (int i = 0; paths[i]; i++) {
++        snprintf(buf, sizeof(buf), "%s/libacl_dvpp_mpi.so", paths[i]);
++        h = dlopen(buf, RTLD_NOW | RTLD_GLOBAL);
++        if (h)
++            return h;
++    }
++    return NULL;
 +}
 +
-+static AscendOutPool *out_pool_alloc(AscendContextRef *cref)
++static int ensure_mpi_ready(AVCodecContext *avctx)
++{
++    int ret = 0;
++
++    pthread_mutex_lock(&ascend_v2_lock);
++    if (!ascend_mpi.mpi_lib) {
++        ascend_mpi.mpi_lib = load_mpi_lib();
++        if (!ascend_mpi.mpi_lib) {
++            av_log(avctx, AV_LOG_ERROR,
++                   "[Ascend] libacl_dvpp_mpi.so not found (DVPP V2 required)\n");
++            ret = AVERROR_EXTERNAL;
++            goto out;
++        }
++
++#define LOAD_MPI(field)                                                      \
++        do {                                                                 \
++            ascend_mpi.field = (void *)dlsym(ascend_mpi.mpi_lib, #field);    \
++            if (!ascend_mpi.field) {                                         \
++                av_log(avctx, AV_LOG_ERROR,                                  \
++                       "[Ascend] missing DVPP V2 symbol %s\n", #field);      \
++                ret = AVERROR_EXTERNAL;                                      \
++                goto out;                                                    \
++            }                                                                \
++        } while (0)
++
++        LOAD_MPI(hi_mpi_sys_init);
++        LOAD_MPI(hi_mpi_dvpp_malloc);
++        LOAD_MPI(hi_mpi_dvpp_free);
++        LOAD_MPI(hi_mpi_vdec_create_chn);
++        LOAD_MPI(hi_mpi_vdec_destroy_chn);
++        LOAD_MPI(hi_mpi_vdec_start_recv_stream);
++        LOAD_MPI(hi_mpi_vdec_stop_recv_stream);
++        LOAD_MPI(hi_mpi_vdec_send_stream);
++        LOAD_MPI(hi_mpi_vdec_get_frame);
++        LOAD_MPI(hi_mpi_vdec_release_frame);
++#undef LOAD_MPI
++        ascend_mpi.hi_mpi_vdec_reset_chn =
++            (void *)dlsym(ascend_mpi.mpi_lib, "hi_mpi_vdec_reset_chn");
++    }
++
++    if (!ascend_mpi.sys_inited) {
++        ff_hi_s32 rc = ascend_mpi.hi_mpi_sys_init();
++        if (rc != 0 && (ff_hi_u32)rc != FF_HI_ERR_SYS_EXIST) {
++            av_log(avctx, AV_LOG_ERROR,
++                   "[Ascend] hi_mpi_sys_init failed: 0x%x\n", (unsigned)rc);
++            ret = AVERROR_EXTERNAL;
++            goto out;
++        }
++        ascend_mpi.sys_inited = 1;
++    }
++
++out:
++    pthread_mutex_unlock(&ascend_v2_lock);
++    return ret;
++}
++
++static int chn_bitmap_try_claim(int ch)
++{
++    int word, ok = 0;
++    uint64_t mask;
++
++    if (ch < 0 || ch >= FF_HI_VDEC_MAX_CHN_NUM)
++        return 0;
++    word = ch >> 6;
++    mask = 1ULL << (ch & 63);
++    pthread_mutex_lock(&ascend_v2_lock);
++    if (!(ascend_chn_bitmap[word] & mask)) {
++        ascend_chn_bitmap[word] |= mask;
++        ok = 1;
++    }
++    pthread_mutex_unlock(&ascend_v2_lock);
++    return ok;
++}
++
++static void chn_bitmap_release(int ch)
++{
++    int word;
++    uint64_t mask;
++
++    if (ch < 0 || ch >= FF_HI_VDEC_MAX_CHN_NUM)
++        return;
++    word = ch >> 6;
++    mask = 1ULL << (ch & 63);
++    pthread_mutex_lock(&ascend_v2_lock);
++    ascend_chn_bitmap[word] &= ~mask;
++    pthread_mutex_unlock(&ascend_v2_lock);
++}
++
++static int chn_bitmap_claim_any(int preferred)
++{
++    if (preferred >= 0 && preferred < FF_HI_VDEC_MAX_CHN_NUM &&
++        chn_bitmap_try_claim(preferred))
++        return preferred;
++
++    pthread_mutex_lock(&ascend_v2_lock);
++    for (int i = 0; i < FF_HI_VDEC_MAX_CHN_NUM; i++) {
++        int ch = (int)((ascend_chn_cursor + (uint32_t)i) % FF_HI_VDEC_MAX_CHN_NUM);
++        int word = ch >> 6;
++        uint64_t mask = 1ULL << (ch & 63);
++        if (!(ascend_chn_bitmap[word] & mask)) {
++            ascend_chn_bitmap[word] |= mask;
++            ascend_chn_cursor = (uint32_t)((ch + 1) % FF_HI_VDEC_MAX_CHN_NUM);
++            pthread_mutex_unlock(&ascend_v2_lock);
++            return ch;
++        }
++    }
++    pthread_mutex_unlock(&ascend_v2_lock);
++    return -1;
++}
++
++static AscendOutPool *out_pool_alloc(AscendContextRef *cref, int max_bufs)
 +{
 +    AscendOutPool *p;
 +    if (!cref)
@@ -336,6 +545,7 @@
 +    atomic_init(&p->refs, 1);
 +    pthread_mutex_init(&p->lock, NULL);
 +    pthread_cond_init(&p->cond, NULL);
++    p->max_bufs = FFMAX(4, FFMIN(max_bufs, ASCEND_OUT_POOL_SIZE));
 +    atomic_fetch_add(&cref->refs, 1);
 +    p->cref = cref;
 +    return p;
@@ -358,8 +568,8 @@
 +        if (cref && cref->context && cref->aclrtSetCurrentContext)
 +            cref->aclrtSetCurrentContext(cref->context);
 +        for (int i = 0; i < p->count; i++) {
-+            if (p->bufs[i] && cref && cref->acldvppFree)
-+                cref->acldvppFree(p->bufs[i]);
++            if (p->bufs[i] && cref && cref->hi_mpi_dvpp_free)
++                cref->hi_mpi_dvpp_free(p->bufs[i]);
 +        }
 +        pthread_cond_destroy(&p->cond);
 +        pthread_mutex_destroy(&p->lock);
@@ -383,10 +593,10 @@
 +        p->allocated--;
 +    pthread_cond_broadcast(&p->cond);
 +    pthread_mutex_unlock(&p->lock);
-+    if (p->cref && p->cref->acldvppFree) {
++    if (p->cref && p->cref->hi_mpi_dvpp_free) {
 +        if (p->cref->context && p->cref->aclrtSetCurrentContext)
 +            p->cref->aclrtSetCurrentContext(p->cref->context);
-+        p->cref->acldvppFree(dev);
++        p->cref->hi_mpi_dvpp_free(dev);
 +    }
 +}
 +
@@ -403,7 +613,7 @@
 +    if (!p)
 +        return 0;
 +    pthread_mutex_lock(&p->lock);
-+    at_cap = (p->count == 0 && p->allocated >= ASCEND_MAX_OUT_BUFS);
++    at_cap = (p->count == 0 && p->allocated >= p->max_bufs);
 +    pthread_mutex_unlock(&p->lock);
 +    return at_cap;
 +}
@@ -422,8 +632,8 @@
 +        void *dev = p->bufs[--p->count];
 +        if (p->allocated > 0)
 +            p->allocated--;
-+        if (dev && p->cref && p->cref->acldvppFree)
-+            p->cref->acldvppFree(dev);
++        if (dev && p->cref && p->cref->hi_mpi_dvpp_free)
++            p->cref->hi_mpi_dvpp_free(dev);
 +    }
 +    p->buf_size = 0;
 +    pthread_cond_broadcast(&p->cond);
@@ -443,23 +653,20 @@
 +            void *old = p->bufs[--p->count];
 +            if (p->allocated > 0)
 +                p->allocated--;
-+            if (old && p->cref && p->cref->acldvppFree)
-+                p->cref->acldvppFree(old);
++            if (old && p->cref && p->cref->hi_mpi_dvpp_free)
++                p->cref->hi_mpi_dvpp_free(old);
 +        }
 +        p->buf_size = size;
 +    }
-+    if (p->count == 0 && !p->closed && p->allocated >= ASCEND_MAX_OUT_BUFS &&
-+        atomic_load(&ctx->running)) {
++    if (p->count == 0 && !p->closed && p->allocated >= p->max_bufs) {
 +        struct timespec ts;
 +        clock_gettime(CLOCK_REALTIME, &ts);
-+        ts.tv_nsec += 100 * 1000000L;
++        ts.tv_nsec += 50 * 1000000L;
 +        if (ts.tv_nsec >= 1000000000L) {
 +            ts.tv_sec++;
 +            ts.tv_nsec -= 1000000000L;
 +        }
-+        while (p->count == 0 && !p->closed &&
-+               p->allocated >= ASCEND_MAX_OUT_BUFS &&
-+               atomic_load(&ctx->running)) {
++        while (p->count == 0 && !p->closed && p->allocated >= p->max_bufs) {
 +            if (pthread_cond_timedwait(&p->cond, &p->lock, &ts) != 0)
 +                break;
 +        }
@@ -472,7 +679,8 @@
 +    p->allocated++;
 +    pthread_mutex_unlock(&p->lock);
 +
-+    if (ctx->acldvppMalloc(&dev, size) != ACL_SUCCESS || !dev) {
++    if (ascend_mpi.hi_mpi_dvpp_malloc((ff_hi_u32)ctx->device_id, &dev,
++                                      (ff_hi_u64)size) != 0 || !dev) {
 +        pthread_mutex_lock(&p->lock);
 +        if (p->allocated > 0)
 +            p->allocated--;
@@ -496,26 +704,24 @@
 +    void *stale_ptr = NULL;
 +    size_t alloc_size;
 +
-+    pthread_mutex_lock(&ctx->lock);
 +    for (int i = ctx->in_pool_count - 1; i >= 0; i--) {
 +        if (ctx->in_pool[i].cap >= need_size) {
 +            *out_ptr = ctx->in_pool[i].ptr;
 +            *out_cap = ctx->in_pool[i].cap;
 +            ctx->in_pool[i] = ctx->in_pool[--ctx->in_pool_count];
-+            pthread_mutex_unlock(&ctx->lock);
 +            return 0;
 +        }
 +    }
 +    if (ctx->in_pool_count > 0)
 +        stale_ptr = ctx->in_pool[--ctx->in_pool_count].ptr;
-+    pthread_mutex_unlock(&ctx->lock);
 +
-+    if (stale_ptr && ctx->acldvppFree)
-+        ctx->acldvppFree(stale_ptr);
++    if (stale_ptr && ascend_mpi.hi_mpi_dvpp_free)
++        ascend_mpi.hi_mpi_dvpp_free(stale_ptr);
 +
 +    alloc_size = FFALIGN(FFMAX(need_size, (size_t)ASCEND_IN_MIN_ALLOC),
-+                         (size_t)(256 * 1024));
-+    if (ctx->acldvppMalloc(out_ptr, alloc_size) != ACL_SUCCESS || !*out_ptr)
++                         (size_t)(128 * 1024));
++    if (ascend_mpi.hi_mpi_dvpp_malloc((ff_hi_u32)ctx->device_id, out_ptr,
++                                      (ff_hi_u64)alloc_size) != 0 || !*out_ptr)
 +        return AVERROR(ENOMEM);
 +    *out_cap = alloc_size;
 +    return 0;
@@ -525,30 +731,76 @@
 +{
 +    if (!ptr)
 +        return;
-+    if (cap > 0) {
-+        pthread_mutex_lock(&ctx->lock);
-+        if (ctx->in_pool_count < ASCEND_IN_POOL_SIZE) {
-+            ctx->in_pool[ctx->in_pool_count].ptr = ptr;
-+            ctx->in_pool[ctx->in_pool_count].cap = cap;
-+            ctx->in_pool_count++;
-+            pthread_mutex_unlock(&ctx->lock);
-+            return;
-+        }
-+        pthread_mutex_unlock(&ctx->lock);
++    if (cap > 0 && ctx->in_pool_count < ASCEND_IN_POOL_SIZE) {
++        ctx->in_pool[ctx->in_pool_count].ptr = ptr;
++        ctx->in_pool[ctx->in_pool_count].cap = cap;
++        ctx->in_pool_count++;
++        return;
 +    }
-+    if (ctx->acldvppFree)
-+        ctx->acldvppFree(ptr);
++    if (ascend_mpi.hi_mpi_dvpp_free)
++        ascend_mpi.hi_mpi_dvpp_free(ptr);
 +}
 +
 +static void in_pool_clear(AscendDecodeContext *ctx)
 +{
-+    pthread_mutex_lock(&ctx->lock);
 +    while (ctx->in_pool_count > 0) {
 +        void *ptr = ctx->in_pool[--ctx->in_pool_count].ptr;
-+        if (ptr && ctx->acldvppFree)
-+            ctx->acldvppFree(ptr);
++        if (ptr && ascend_mpi.hi_mpi_dvpp_free)
++            ascend_mpi.hi_mpi_dvpp_free(ptr);
 +    }
-+    pthread_mutex_unlock(&ctx->lock);
++}
++
++static void active_track_push(AscendDecodeContext *ctx, void *in_dev,
++                              size_t in_cap, void *out_dev)
++{
++    if (in_dev && ctx->in_active_count < ASCEND_ACTIVE_SLOTS) {
++        ctx->in_active[ctx->in_active_count].ptr = in_dev;
++        ctx->in_active[ctx->in_active_count].cap = in_cap;
++        ctx->in_active_count++;
++    }
++    if (out_dev && ctx->out_active_count < ASCEND_ACTIVE_SLOTS)
++        ctx->out_active[ctx->out_active_count++] = out_dev;
++}
++
++static void active_reclaim_in(AscendDecodeContext *ctx, void *in_dev)
++{
++    size_t cap = 0;
++
++    if (!in_dev)
++        return;
++    for (int i = 0; i < ctx->in_active_count; i++) {
++        if (ctx->in_active[i].ptr == in_dev) {
++            cap = ctx->in_active[i].cap;
++            ctx->in_active[i] = ctx->in_active[--ctx->in_active_count];
++            break;
++        }
++    }
++    in_pool_put(ctx, in_dev, cap);
++}
++
++static void active_remove_out(AscendDecodeContext *ctx, void *out_dev)
++{
++    if (!out_dev)
++        return;
++    for (int i = 0; i < ctx->out_active_count; i++) {
++        if (ctx->out_active[i] == out_dev) {
++            ctx->out_active[i] = ctx->out_active[--ctx->out_active_count];
++            return;
++        }
++    }
++}
++
++static void active_reclaim_all(AscendDecodeContext *ctx)
++{
++    while (ctx->in_active_count > 0) {
++        AscendInBuf b = ctx->in_active[--ctx->in_active_count];
++        in_pool_put(ctx, b.ptr, b.cap);
++    }
++    while (ctx->out_active_count > 0) {
++        void *dev = ctx->out_active[--ctx->out_active_count];
++        out_pool_put(ctx, dev);
++    }
++    ctx->in_flight = 0;
 +}
 +
 +static void ascend_host_buf_free(void *opaque, uint8_t *data)
@@ -606,204 +858,27 @@
 +    ctx->host_frame_size = 0;
 +}
 +
-+static void queue_clear_locked(AscendDecodeContext *ctx)
-+{
-+    while (ctx->queue_count > 0) {
-+        AscendFrame *f = &ctx->queue[ctx->queue_head];
-+        if (f->pic) {
-+            void *dev = ctx->acldvppGetPicDescData(f->pic);
-+            if (dev)
-+                out_pool_put(ctx, dev);
-+            ctx->acldvppDestroyPicDesc(f->pic);
-+            f->pic = NULL;
-+        }
-+        ctx->queue_head = (ctx->queue_head + 1) % ASCEND_QUEUE_DEPTH;
-+        ctx->queue_count--;
-+    }
-+    ctx->queue_head = ctx->queue_tail = 0;
-+}
-+
-+static void queue_clear(AscendDecodeContext *ctx)
-+{
-+    pthread_mutex_lock(&ctx->lock);
-+    queue_clear_locked(ctx);
-+    pthread_mutex_unlock(&ctx->lock);
-+}
-+
-+static void queue_push(AscendDecodeContext *ctx, acldvppPicDesc *pic,
-+                       int64_t pts, int64_t dts)
-+{
-+    pthread_mutex_lock(&ctx->lock);
-+    if (ctx->queue_count == ASCEND_QUEUE_DEPTH) {
-+        AscendFrame *old = &ctx->queue[ctx->queue_head];
-+        av_log(NULL, AV_LOG_WARNING, "[Ascend] output queue full, frame dropped\n");
-+        if (old->pic) {
-+            void *dev = ctx->acldvppGetPicDescData(old->pic);
-+            if (dev)
-+                out_pool_put(ctx, dev);
-+            ctx->acldvppDestroyPicDesc(old->pic);
-+            old->pic = NULL;
-+        }
-+        ctx->queue_head = (ctx->queue_head + 1) % ASCEND_QUEUE_DEPTH;
-+        ctx->queue_count--;
-+    }
-+    ctx->queue[ctx->queue_tail].pic = pic;
-+    ctx->queue[ctx->queue_tail].pts = pts;
-+    ctx->queue[ctx->queue_tail].dts = dts;
-+    ctx->queue_tail = (ctx->queue_tail + 1) % ASCEND_QUEUE_DEPTH;
-+    ctx->queue_count++;
-+    pthread_cond_broadcast(&ctx->cond);
-+    pthread_mutex_unlock(&ctx->lock);
-+}
-+
-+static void *ascend_callback_thread(void *arg)
-+{
-+    AscendDecodeContext *ctx = arg;
-+
-+    if (ctx->context && ctx->aclrtSetCurrentContext)
-+        ctx->aclrtSetCurrentContext(ctx->context);
-+
-+    pthread_mutex_lock(&ctx->lock);
-+    ctx->callback_tid = ascend_thread_id();
-+    ctx->callback_thread_started = 1;
-+    pthread_cond_broadcast(&ctx->thread_started);
-+    pthread_mutex_unlock(&ctx->lock);
-+
-+    while (atomic_load(&ctx->running))
-+        ctx->aclrtProcessReport(100);
-+
-+    return NULL;
-+}
-+
-+static void ascend_vdec_callback(acldvppStreamDesc *input,
-+                                 acldvppPicDesc *output, void *user_data)
-+{
-+    AscendFrameMeta *meta = user_data;
-+    AscendDecodeContext *ctx = meta ? meta->ctx : NULL;
-+    int pushed = 0;
-+
-+    if (input && ctx) {
-+        void *in_dev = ctx->acldvppGetStreamDescData(input);
-+        if (in_dev)
-+            in_pool_put(ctx, in_dev, meta ? meta->in_cap : 0);
-+        ctx->acldvppDestroyStreamDesc(input);
-+    }
-+
-+    if (meta) {
-+        atomic_fetch_sub(&ctx->in_flight, 1);
-+        atomic_fetch_add(&ctx->cb_count, 1);
-+    }
-+
-+    if (output && ctx) {
-+        uint32_t ret_code = ctx->acldvppGetPicDescRetCode(output);
-+        if (!ret_code) {
-+            queue_push(ctx, output, meta ? meta->pts : AV_NOPTS_VALUE,
-+                       meta ? meta->dts : AV_NOPTS_VALUE);
-+            pushed = 1;
-+        } else {
-+            void *dev = ctx->acldvppGetPicDescData(output);
-+            if (dev)
-+                out_pool_put(ctx, dev);
-+            ctx->acldvppDestroyPicDesc(output);
-+            av_log(NULL, ret_code == 0x20000 ? AV_LOG_DEBUG : AV_LOG_WARNING,
-+                   "[Ascend] VDEC frame failed, retCode=0x%x\n", ret_code);
-+        }
-+    }
-+
-+    if (meta) {
-+        if (!pushed) {
-+            pthread_mutex_lock(&ctx->lock);
-+            pthread_cond_broadcast(&ctx->cond);
-+            pthread_mutex_unlock(&ctx->lock);
-+        }
-+        av_free(meta);
-+    }
-+}
-+
-+static int load_symbols(AVCodecContext *avctx)
++static int load_acl_symbols(AVCodecContext *avctx)
 +{
 +    AscendDecodeContext *ctx = avctx->priv_data;
 +    void *acl = ctx->acl_lib;
-+    void *dvpp = ctx->dvpp_lib;
 +
-+#define LOAD_SYM(field, lib)                                              \
++#define LOAD_SYM(field)                                                   \
 +    do {                                                                  \
-+        ctx->field = (void *)get_dyn_sym(lib, #field);                    \
++        ctx->field = (void *)get_dyn_sym(acl, #field);                    \
 +        if (!ctx->field) {                                                \
-+            av_log(avctx, AV_LOG_ERROR, "[Ascend] missing symbol %s\n",  \
++            av_log(avctx, AV_LOG_ERROR, "[Ascend] missing symbol %s\n",   \
 +                   #field);                                               \
 +            return AVERROR_EXTERNAL;                                      \
 +        }                                                                 \
 +    } while (0)
 +
-+#define LOAD_OPT_SYM(field, lib)                                          \
-+    ctx->field = (void *)get_dyn_sym(lib, #field)
-+
-+    LOAD_SYM(aclrtSetCurrentContext, acl);
-+    LOAD_SYM(aclrtProcessReport, acl);
-+    LOAD_SYM(aclrtMallocHost, acl);
-+    LOAD_SYM(aclrtFreeHost, acl);
-+    LOAD_SYM(aclrtMemcpy, acl);
-+
-+    LOAD_SYM(acldvppMalloc, dvpp);
-+    LOAD_SYM(acldvppFree, dvpp);
-+
-+    LOAD_SYM(aclvdecCreateChannelDesc, dvpp);
-+    LOAD_SYM(aclvdecDestroyChannelDesc, dvpp);
-+    LOAD_SYM(aclvdecSetChannelDescChannelId, dvpp);
-+    LOAD_SYM(aclvdecSetChannelDescThreadId, dvpp);
-+    LOAD_SYM(aclvdecSetChannelDescCallback, dvpp);
-+    LOAD_SYM(aclvdecSetChannelDescEnType, dvpp);
-+    LOAD_SYM(aclvdecSetChannelDescOutPicFormat, dvpp);
-+    LOAD_OPT_SYM(aclvdecSetChannelDescOutPicWidth, dvpp);
-+    LOAD_OPT_SYM(aclvdecSetChannelDescOutPicHeight, dvpp);
-+    LOAD_SYM(aclvdecCreateChannel, dvpp);
-+    LOAD_SYM(aclvdecDestroyChannel, dvpp);
-+
-+    LOAD_SYM(acldvppCreateStreamDesc, dvpp);
-+    LOAD_SYM(acldvppDestroyStreamDesc, dvpp);
-+    LOAD_SYM(acldvppSetStreamDescData, dvpp);
-+    LOAD_SYM(acldvppSetStreamDescSize, dvpp);
-+    LOAD_SYM(acldvppSetStreamDescEos, dvpp);
-+    LOAD_SYM(acldvppGetStreamDescData, dvpp);
-+
-+    LOAD_SYM(acldvppCreatePicDesc, dvpp);
-+    LOAD_SYM(acldvppDestroyPicDesc, dvpp);
-+    LOAD_SYM(acldvppSetPicDescData, dvpp);
-+    LOAD_SYM(acldvppSetPicDescSize, dvpp);
-+    LOAD_SYM(acldvppSetPicDescFormat, dvpp);
-+    LOAD_SYM(acldvppSetPicDescWidth, dvpp);
-+    LOAD_SYM(acldvppSetPicDescHeight, dvpp);
-+    LOAD_SYM(acldvppSetPicDescWidthStride, dvpp);
-+    LOAD_SYM(acldvppSetPicDescHeightStride, dvpp);
-+    LOAD_SYM(acldvppGetPicDescData, dvpp);
-+    LOAD_SYM(acldvppGetPicDescWidth, dvpp);
-+    LOAD_SYM(acldvppGetPicDescHeight, dvpp);
-+    LOAD_SYM(acldvppGetPicDescWidthStride, dvpp);
-+    LOAD_SYM(acldvppGetPicDescHeightStride, dvpp);
-+    LOAD_SYM(acldvppGetPicDescRetCode, dvpp);
-+
-+    LOAD_SYM(aclvdecSendFrame, dvpp);
-+
++    LOAD_SYM(aclrtSetCurrentContext);
++    LOAD_SYM(aclrtMallocHost);
++    LOAD_SYM(aclrtFreeHost);
++    LOAD_SYM(aclrtMemcpy);
 +#undef LOAD_SYM
-+#undef LOAD_OPT_SYM
 +    return 0;
-+}
-+
-+static acldvppStreamFormat map_en_type(const AVCodecContext *avctx)
-+{
-+    if (avctx->codec_id == AV_CODEC_ID_HEVC)
-+        return H265_MAIN_LEVEL;
-+
-+    switch (avctx->profile) {
-+    case AV_PROFILE_H264_BASELINE:
-+    case AV_PROFILE_H264_CONSTRAINED_BASELINE:
-+        return H264_BASELINE_LEVEL;
-+    case AV_PROFILE_H264_MAIN:
-+        return H264_MAIN_LEVEL;
-+    default:
-+        return H264_HIGH_LEVEL;
-+    }
 +}
 +
 +static void get_dimensions(AVCodecContext *avctx, int *width, int *height,
@@ -825,15 +900,18 @@
 +
 +static void ascend_destroy_channel(AscendDecodeContext *ctx)
 +{
-+    if (!ctx->channel_desc)
++    if (!ctx->channel_created)
 +        return;
-+    if (ctx->aclvdecDestroyChannel)
-+        ctx->aclvdecDestroyChannel(ctx->channel_desc);
-+    if (ctx->aclvdecDestroyChannelDesc)
-+        ctx->aclvdecDestroyChannelDesc(ctx->channel_desc);
-+    ctx->channel_desc = NULL;
++    if (ascend_mpi.hi_mpi_vdec_stop_recv_stream)
++        ascend_mpi.hi_mpi_vdec_stop_recv_stream(ctx->active_chn);
++    if (ascend_mpi.hi_mpi_vdec_destroy_chn)
++        ascend_mpi.hi_mpi_vdec_destroy_chn(ctx->active_chn);
++    chn_bitmap_release(ctx->active_chn);
++    ctx->channel_created = 0;
++    ctx->active_chn = -1;
 +    ctx->channel_width = 0;
 +    ctx->channel_height = 0;
++    active_reclaim_all(ctx);
 +}
 +
 +static int ascend_ensure_hw_frames(AVCodecContext *avctx, int width, int height)
@@ -884,100 +962,83 @@
 +    return avctx->hw_frames_ctx ? 0 : AVERROR(ENOMEM);
 +}
 +
-+/*
-+ * 5-bit bijection on [0..31] that strictly alternates consecutive PIDs/streams
-+ * across [0..15] vs [16..31], across all four 8-channel banks, and across parity,
-+ * mapping <=32 concurrent decoders 1:1 onto Ascend 310P3's 32 physical VDEC slots
-+ * without virtual-channel thrashing, while overflowing to [32..255] when busy.
-+ */
-+static inline int ascend_perm32(unsigned k)
-+{
-+    return (int)(((k & 1u) << 4) |
-+                 (((k >> 1) & 1u) << 3) |
-+                 (k & 4u) |
-+                 (((k >> 3) & 1u) << 1) |
-+                 ((k ^ (k >> 4)) & 1u));
-+}
-+
 +static int ascend_create_channel(AVCodecContext *avctx, int coded_w, int coded_h)
 +{
 +    AscendDecodeContext *ctx = avctx->priv_data;
 +    uint32_t stride_w = FFALIGN(coded_w, ASCEND_ALIGN_WIDTH);
 +    uint32_t stride_h = FFALIGN(coded_h, ASCEND_ALIGN_HEIGHT);
-+    unsigned base = (unsigned)getpid() +
-+                    (unsigned)atomic_fetch_add(&ascend_channel_counter, 1);
-+    int user_ch = (ctx->channel_id >= 0 && ctx->channel_id < 256) ? ctx->channel_id : -1;
-+    int max_attempts = (user_ch >= 0) ? 257 : 256;
-+    aclError ret = ACL_ERROR_INVALID_PARAM;
++    uint32_t stream_buf_sz = FFMAX(stride_w * stride_h * 3u / 2u, 1024u * 1024u);
++    uint32_t ref_num = (avctx->refs > 0 && avctx->refs <= 16)
++                       ? (uint32_t)avctx->refs : 4u;
++    ff_hi_vdec_chn_attr attr;
++    ff_hi_s32 rc = -1;
++    int preferred = (ctx->channel_id >= 0 && ctx->channel_id < FF_HI_VDEC_MAX_CHN_NUM)
++                    ? ctx->channel_id : -1;
++    int external_busy[FF_HI_VDEC_MAX_CHN_NUM];
++    int external_busy_cnt = 0;
 +
-+    for (int attempt = 0; attempt < max_attempts; attempt++) {
-+        int ch;
-+        if (user_ch >= 0 && attempt == 0) {
-+            ch = user_ch;
-+        } else {
-+            int idx = (user_ch >= 0) ? (attempt - 1) : attempt;
-+            if (idx < 32)
-+                ch = ascend_perm32((base + (unsigned)idx) & 31u);
-+            else
-+                ch = 32 + (int)(((base + (unsigned)(idx - 32)) * 149u) % 224u);
-+            if (user_ch >= 0 && ch == user_ch)
-+                continue;
-+        }
++    memset(&attr, 0, sizeof(attr));
++    attr.type            = (avctx->codec_id == AV_CODEC_ID_HEVC) ? FF_HI_PT_H265 : FF_HI_PT_H264;
++    attr.mode            = FF_HI_VDEC_SEND_MODE_FRAME;
++    attr.pic_width       = (ff_hi_u32)coded_w;
++    attr.pic_height      = (ff_hi_u32)coded_h;
++    attr.stream_buf_size = stream_buf_sz;
++    attr.frame_buf_size  = 0;
++    attr.frame_buf_cnt   = 0;
++    attr.video_attr.ref_frame_num   = ref_num;
++    attr.video_attr.temporal_mvp_en = 0;
++    attr.video_attr.tmv_buf_size    = 0;
 +
-+        ctx->channel_desc = ctx->aclvdecCreateChannelDesc();
-+        if (!ctx->channel_desc) {
-+            av_log(avctx, AV_LOG_ERROR, "[Ascend] aclvdecCreateChannelDesc failed\n");
-+            return AVERROR_EXTERNAL;
-+        }
++    for (int attempt = 0; attempt < FF_HI_VDEC_MAX_CHN_NUM; attempt++) {
++        int ch = chn_bitmap_claim_any(attempt == 0 ? preferred : -1);
++        if (ch < 0)
++            break;
 +
-+        ret = ctx->aclvdecSetChannelDescChannelId(ctx->channel_desc, (uint32_t)ch);
-+        if (ret != ACL_SUCCESS) {
-+            ctx->aclvdecDestroyChannelDesc(ctx->channel_desc);
-+            ctx->channel_desc = NULL;
-+            if (ch >= 32)
-+                continue;
-+            av_log(avctx, AV_LOG_ERROR, "[Ascend] set channel id %d failed: 0x%x\n", ch, ret);
-+            return AVERROR_EXTERNAL;
-+        }
-+
-+        ret  = ctx->aclvdecSetChannelDescThreadId(ctx->channel_desc, ctx->callback_tid);
-+        ret |= ctx->aclvdecSetChannelDescCallback(ctx->channel_desc, ascend_vdec_callback);
-+        ret |= ctx->aclvdecSetChannelDescEnType(ctx->channel_desc, map_en_type(avctx));
-+        ret |= ctx->aclvdecSetChannelDescOutPicFormat(ctx->channel_desc,
-+                                                      PIXEL_FORMAT_YUV_SEMIPLANAR_420);
-+        if (ctx->aclvdecSetChannelDescOutPicWidth)
-+            ctx->aclvdecSetChannelDescOutPicWidth(ctx->channel_desc, coded_w);
-+        if (ctx->aclvdecSetChannelDescOutPicHeight)
-+            ctx->aclvdecSetChannelDescOutPicHeight(ctx->channel_desc, coded_h);
-+
-+        if (ret != ACL_SUCCESS) {
-+            av_log(avctx, AV_LOG_ERROR, "[Ascend] channel descriptor setup failed\n");
-+            ctx->aclvdecDestroyChannelDesc(ctx->channel_desc);
-+            ctx->channel_desc = NULL;
-+            return AVERROR_EXTERNAL;
-+        }
-+
-+        ret = ctx->aclvdecCreateChannel(ctx->channel_desc);
-+        if (ret == ACL_SUCCESS) {
-+            ctx->channel_id = ch;
++        rc = ascend_mpi.hi_mpi_vdec_create_chn(ch, &attr);
++        if (rc == 0) {
++            ff_hi_s32 src = ascend_mpi.hi_mpi_vdec_start_recv_stream(ch);
++            if (src == 0) {
++                ctx->active_chn = ch;
++                ctx->channel_created = 1;
++                break;
++            }
++            ascend_mpi.hi_mpi_vdec_destroy_chn(ch);
++            chn_bitmap_release(ch);
++            av_log(avctx, AV_LOG_ERROR,
++                   "[Ascend] hi_mpi_vdec_start_recv_stream(ch=%d) failed: 0x%x\n",
++                   ch, (unsigned)src);
++            rc = src;
 +            break;
 +        }
-+        ctx->aclvdecDestroyChannelDesc(ctx->channel_desc);
-+        ctx->channel_desc = NULL;
++
++        if ((ff_hi_u32)rc == FF_HI_ERR_VDEC_EXIST) {
++            /* Channel ID is held by another VDEC/JPEGD user in the same process;
++               keep claimed temporarily during scan so we skip it, release after loop. */
++            if (external_busy_cnt < FF_HI_VDEC_MAX_CHN_NUM)
++                external_busy[external_busy_cnt++] = ch;
++            continue;
++        }
++
++        chn_bitmap_release(ch);
++        break;
 +    }
 +
-+    if (ret != ACL_SUCCESS || !ctx->channel_desc) {
++    for (int i = 0; i < external_busy_cnt; i++)
++        chn_bitmap_release(external_busy[i]);
++
++    if (!ctx->channel_created) {
 +        av_log(avctx, AV_LOG_ERROR,
-+               "[Ascend] aclvdecCreateChannel(%dx%d) failed across all channels: 0x%x\n",
-+               coded_w, coded_h, ret);
++               "[Ascend] hi_mpi_vdec_create_chn(%dx%d, ref=%u) failed: 0x%x\n",
++               coded_w, coded_h, ref_num, (unsigned)rc);
 +        return AVERROR_EXTERNAL;
 +    }
 +
 +    ctx->channel_width  = coded_w;
 +    ctx->channel_height = coded_h;
++    ctx->extradata_sent = 0;
 +    av_log(avctx, AV_LOG_INFO,
-+           "[Ascend] DVPP VDEC ready (device=%d, ch=%d, %dx%d, stride=%ux%u, mode=%s)\n",
-+           ctx->device_id, ctx->channel_id, coded_w, coded_h, stride_w, stride_h,
++           "[Ascend] DVPP V2 VDEC ready (device=%d, ch=%d, %dx%d, stride=%ux%u, ref=%u, mode=%s)\n",
++           ctx->device_id, ctx->active_chn, coded_w, coded_h, stride_w, stride_h, ref_num,
 +           avctx->pix_fmt == AV_PIX_FMT_ASCEND ? "device-zero-copy" : "host-pinned");
 +    return 0;
 +}
@@ -988,7 +1049,7 @@
 +    AscendDecodeContext *ctx = avctx->priv_data;
 +    int ret;
 +
-+    if (ctx->channel_desc &&
++    if (ctx->channel_created &&
 +        coded_w == ctx->channel_width && coded_h == ctx->channel_height)
 +        return 0;
 +
@@ -1004,56 +1065,51 @@
 +            return ret;
 +    }
 +
-+    if (ctx->channel_desc) {
++    if (ctx->channel_created) {
 +        av_log(avctx, AV_LOG_WARNING,
-+               "[Ascend] resolution changed %dx%d -> %dx%d, recreating channel\n",
++               "[Ascend] resolution changed %dx%d -> %dx%d, recreating V2 channel\n",
 +               ctx->channel_width, ctx->channel_height, coded_w, coded_h);
-+
-+        /* Wait for existing in-flight frames before recreating to prevent cross-resolution pool pollution */
-+        while (atomic_load(&ctx->in_flight) > 0) {
-+            struct timespec ts;
-+            clock_gettime(CLOCK_REALTIME, &ts);
-+            ts.tv_nsec += 20 * 1000000;
-+            if (ts.tv_nsec >= 1000000000) {
-+                ts.tv_sec++;
-+                ts.tv_nsec -= 1000000000;
-+            }
-+            pthread_mutex_lock(&ctx->lock);
-+            pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
-+            pthread_mutex_unlock(&ctx->lock);
-+        }
-+
 +        ascend_destroy_channel(ctx);
-+        queue_clear(ctx);
-+
-+        /* Mark old pool closed and unref it; allocate a brand new pool for the new resolution */
 +        out_pool_clear(ctx, 1);
 +        out_pool_unref(ctx->out_pool);
-+        ctx->out_pool = out_pool_alloc(ctx->cref);
++        ctx->out_pool = out_pool_alloc(ctx->cref, ctx->max_out_bufs);
 +        if (!ctx->out_pool)
 +            return AVERROR(ENOMEM);
-+
 +        ascend_free_host_pool(ctx);
-+        atomic_store(&ctx->in_flight, 0);
 +        ctx->eof_reached = ctx->eos_sent = ctx->eos_done = 0;
 +    }
 +    return ascend_create_channel(avctx, coded_w, coded_h);
 +}
 +
++static int has_annexb_start_code(const uint8_t *buf, int size)
++{
++    if (!buf || size < 4)
++        return 0;
++    if (buf[0] == 0 && buf[1] == 0 && buf[2] == 1)
++        return 1;
++    if (buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 1)
++        return 1;
++    return 0;
++}
++
 +static int ascend_send_packet(AVCodecContext *avctx, const AVPacket *pkt)
 +{
 +    AscendDecodeContext *ctx = avctx->priv_data;
-+    acldvppStreamDesc *stream = NULL;
-+    acldvppPicDesc *pic = NULL;
-+    AscendFrameMeta *meta = NULL;
++    ff_hi_vdec_stream stream;
++    ff_hi_vdec_pic_info pic;
 +    void *in_dev = NULL;
 +    size_t in_cap = 0;
 +    void *out_dev = NULL;
 +    int width, height, coded_w, coded_h;
 +    uint32_t stride_w, stride_h;
 +    size_t out_size;
++    size_t extra_sz = 0;
++    size_t total_in_sz;
 +    int attempts = 0;
 +    int ret;
++
++    if (!pkt->size)
++        return 0;
 +
 +    get_dimensions(avctx, &width, &height, &coded_w, &coded_h);
 +    ret = ascend_ensure_channel(avctx, width, height, coded_w, coded_h);
@@ -1064,188 +1120,304 @@
 +    stride_h = FFALIGN(coded_h, ASCEND_ALIGN_HEIGHT);
 +    out_size = (size_t)stride_w * stride_h * 3 / 2;
 +
-+    if (!pkt->size)
-+        return AVERROR(EINVAL);
++    if (!ctx->extradata_sent &&
++        avctx->extradata && avctx->extradata_size >= 4 &&
++        has_annexb_start_code(avctx->extradata, avctx->extradata_size)) {
++        if (pkt->size < avctx->extradata_size ||
++            memcmp(pkt->data, avctx->extradata, avctx->extradata_size) != 0)
++            extra_sz = (size_t)avctx->extradata_size;
++        ctx->extradata_sent = 1;
++    }
 +
-+    ret = in_pool_get(ctx, pkt->size, &in_dev, &in_cap);
++    total_in_sz = extra_sz + (size_t)pkt->size;
++    ret = in_pool_get(ctx, total_in_sz, &in_dev, &in_cap);
 +    if (ret < 0)
 +        return ret;
 +
-+    if (ctx->aclrtMemcpy(in_dev, in_cap, pkt->data, pkt->size,
-+                         ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
-+        in_pool_put(ctx, in_dev, in_cap);
-+        return AVERROR_EXTERNAL;
-+    }
-+
-+    stream = ctx->acldvppCreateStreamDesc();
-+    if (!stream) {
-+        in_pool_put(ctx, in_dev, in_cap);
-+        return AVERROR(ENOMEM);
-+    }
-+    if (ctx->acldvppSetStreamDescData(stream, in_dev) != ACL_SUCCESS ||
-+        ctx->acldvppSetStreamDescSize(stream, pkt->size) != ACL_SUCCESS) {
-+        ctx->acldvppDestroyStreamDesc(stream);
-+        in_pool_put(ctx, in_dev, in_cap);
-+        return AVERROR_EXTERNAL;
++    if (extra_sz > 0) {
++        if (ctx->aclrtMemcpy(in_dev, in_cap, avctx->extradata, extra_sz,
++                             ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS ||
++            ctx->aclrtMemcpy((uint8_t *)in_dev + extra_sz, in_cap - extra_sz,
++                             pkt->data, pkt->size,
++                             ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
++            in_pool_put(ctx, in_dev, in_cap);
++            return AVERROR_EXTERNAL;
++        }
++    } else {
++        if (ctx->aclrtMemcpy(in_dev, in_cap, pkt->data, pkt->size,
++                             ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
++            in_pool_put(ctx, in_dev, in_cap);
++            return AVERROR_EXTERNAL;
++        }
 +    }
 +
 +    out_dev = out_pool_get(ctx, out_size);
 +    if (!out_dev) {
-+        ctx->acldvppDestroyStreamDesc(stream);
 +        in_pool_put(ctx, in_dev, in_cap);
 +        return AVERROR(ENOMEM);
 +    }
-+    pic = ctx->acldvppCreatePicDesc();
-+    if (!pic ||
-+        ctx->acldvppSetPicDescData(pic, out_dev) != ACL_SUCCESS ||
-+        ctx->acldvppSetPicDescSize(pic, out_size) != ACL_SUCCESS ||
-+        ctx->acldvppSetPicDescFormat(pic, PIXEL_FORMAT_YUV_SEMIPLANAR_420) != ACL_SUCCESS ||
-+        ctx->acldvppSetPicDescWidth(pic, coded_w) != ACL_SUCCESS ||
-+        ctx->acldvppSetPicDescHeight(pic, coded_h) != ACL_SUCCESS ||
-+        ctx->acldvppSetPicDescWidthStride(pic, stride_w) != ACL_SUCCESS ||
-+        ctx->acldvppSetPicDescHeightStride(pic, stride_h) != ACL_SUCCESS) {
-+        if (pic)
-+            ctx->acldvppDestroyPicDesc(pic);
-+        out_pool_put(ctx, out_dev);
-+        ctx->acldvppDestroyStreamDesc(stream);
-+        in_pool_put(ctx, in_dev, in_cap);
-+        return AVERROR_EXTERNAL;
-+    }
 +
-+    meta = av_mallocz(sizeof(*meta));
-+    if (!meta) {
-+        ctx->acldvppDestroyPicDesc(pic);
-+        out_pool_put(ctx, out_dev);
-+        ctx->acldvppDestroyStreamDesc(stream);
-+        in_pool_put(ctx, in_dev, in_cap);
-+        return AVERROR(ENOMEM);
-+    }
-+    meta->ctx = ctx;
-+    meta->in_cap = in_cap;
-+    meta->pts = pkt->pts;
-+    meta->dts = pkt->dts;
++    memset(&stream, 0, sizeof(stream));
++    stream.addr          = (ff_hi_u8 *)in_dev;
++    stream.len           = (ff_hi_u32)total_in_sz;
++    stream.end_of_frame  = 1;
++    stream.end_of_stream = 0;
++    stream.need_display  = 1;
++    stream.pts           = (ff_hi_u64)pkt->pts;
 +
-+    atomic_fetch_add(&ctx->in_flight, 1);
++    memset(&pic, 0, sizeof(pic));
++    pic.width         = (ff_hi_u32)coded_w;
++    pic.height        = (ff_hi_u32)coded_h;
++    pic.width_stride  = stride_w;
++    pic.height_stride = stride_h;
++    pic.pixel_format  = FF_HI_PIXEL_FORMAT_YUV_SP_420;
++    pic.vir_addr      = (ff_hi_u64)(uintptr_t)out_dev;
++    pic.buffer_size   = (ff_hi_u32)out_size;
++
 +    for (;;) {
-+        aclError acl_ret = ctx->aclvdecSendFrame(ctx->channel_desc, stream, pic,
-+                                                 NULL, meta);
-+        if (acl_ret == ACL_SUCCESS)
++        ff_hi_s32 rc = ascend_mpi.hi_mpi_vdec_send_stream(ctx->active_chn, &stream, &pic, 200);
++        if (rc == 0)
 +            break;
-+        if ((int)acl_ret == ASCEND_VDEC_BUF_FULL && attempts++ < 5000 &&
-+            atomic_load(&ctx->running)) {
-+            av_usleep(1000);
++        if (((ff_hi_u32)rc == FF_HI_ERR_VDEC_BUF_FULL ||
++             (ff_hi_u32)rc == FF_HI_ERR_VDEC_BUSY) && attempts++ < 25) {
++            av_usleep(2000);
 +            continue;
 +        }
-+        atomic_fetch_sub(&ctx->in_flight, 1);
 +        av_log(avctx, AV_LOG_ERROR,
-+               "[Ascend] aclvdecSendFrame failed: 0x%x\n", acl_ret);
-+        av_free(meta);
-+        ctx->acldvppDestroyPicDesc(pic);
++               "[Ascend] hi_mpi_vdec_send_stream(ch=%d) failed: 0x%x\n",
++               ctx->active_chn, (unsigned)rc);
 +        out_pool_put(ctx, out_dev);
-+        ctx->acldvppDestroyStreamDesc(stream);
 +        in_pool_put(ctx, in_dev, in_cap);
 +        return AVERROR_EXTERNAL;
 +    }
 +
++    active_track_push(ctx, in_dev, in_cap, out_dev);
++    ctx->in_flight++;
 +    return 0;
 +}
 +
 +static int ascend_send_eos(AVCodecContext *avctx)
 +{
 +    AscendDecodeContext *ctx = avctx->priv_data;
-+    acldvppStreamDesc *stream;
-+    int attempts = 0;
-+    aclError ret;
++    ff_hi_vdec_stream eos;
++    ff_hi_vdec_pic_info pic;
++    ff_hi_s32 rc;
 +
-+    if (ctx->context && ctx->aclrtSetCurrentContext)
-+        ctx->aclrtSetCurrentContext(ctx->context);
-+
-+    if (!ctx->channel_desc) {
++    if (!ctx->channel_created) {
 +        ctx->eos_done = 1;
 +        return 0;
 +    }
 +
-+    stream = ctx->acldvppCreateStreamDesc();
-+    if (!stream)
-+        return AVERROR(ENOMEM);
-+    ret = ctx->acldvppSetStreamDescEos(stream, 1);
-+    if (ret != ACL_SUCCESS) {
-+        ctx->acldvppDestroyStreamDesc(stream);
++    memset(&eos, 0, sizeof(eos));
++    memset(&pic, 0, sizeof(pic));
++    eos.end_of_stream = 1;
++
++    rc = ascend_mpi.hi_mpi_vdec_send_stream(ctx->active_chn, &eos, &pic, 1000);
++    if (rc != 0) {
++        av_log(avctx, AV_LOG_WARNING,
++               "[Ascend] V2 EOS send(ch=%d) returned: 0x%x\n",
++               ctx->active_chn, (unsigned)rc);
++    }
++    return 0;
++}
++
++static int ascend_wrap_output_frame(AVCodecContext *avctx, AVFrame *frame,
++                                    const ff_hi_video_frame *vf)
++{
++    AscendDecodeContext *ctx = avctx->priv_data;
++    void *dev = vf->virt_addr[0];
++    uint32_t desc_w = vf->width;
++    uint32_t desc_h = vf->height;
++    uint32_t stride_w = vf->width_stride[0];
++    uint32_t stride_h = vf->height_stride[0];
++    int width = desc_w ? (avctx->width > 0 ? FFMIN(avctx->width, (int)desc_w) : (int)desc_w)
++                       : (avctx->width > 0 ? avctx->width : 1920);
++    int height = desc_h ? (avctx->height > 0 ? FFMIN(avctx->height, (int)desc_h) : (int)desc_h)
++                        : (avctx->height > 0 ? avctx->height : 1080);
++    int chroma_h;
++    size_t y_size, uv_size, copy_size;
++    int ret;
++
++    if (!dev || !stride_w || !stride_h || width <= 0 || height <= 0 ||
++        stride_w < (uint32_t)width || stride_h < (uint32_t)height) {
++        av_log(avctx, AV_LOG_WARNING,
++               "[Ascend] invalid V2 output frame: %dx%d stride %ux%u\n",
++               width, height, stride_w, stride_h);
++        if (dev)
++            out_pool_put(ctx, dev);
 +        return AVERROR_EXTERNAL;
 +    }
 +
-+    for (;;) {
-+        ret = ctx->aclvdecSendFrame(ctx->channel_desc, stream, NULL, NULL, NULL);
-+        if (ret == ACL_SUCCESS)
-+            break;
-+        if ((int)ret == ASCEND_VDEC_BUF_FULL && attempts++ < 5000 &&
-+            atomic_load(&ctx->running)) {
-+            av_usleep(1000);
-+            continue;
-+        }
-+        ctx->acldvppDestroyStreamDesc(stream);
-+        av_log(avctx, AV_LOG_ERROR, "[Ascend] EOS send failed: 0x%x\n", ret);
-+        return AVERROR_EXTERNAL;
++    if (avctx->width <= 0 || avctx->height <= 0)
++        ff_set_dimensions(avctx, width, height);
++
++    y_size = (size_t)stride_w * stride_h;
++    chroma_h = (height + 1) / 2;
++    uv_size = (size_t)stride_w * chroma_h;
++    copy_size = y_size + uv_size;
++
++    frame->width  = width;
++    frame->height = height;
++    frame->format = avctx->pix_fmt;
++    ret = ff_decode_frame_props(avctx, frame);
++    if (ret < 0) {
++        out_pool_put(ctx, dev);
++        return ret;
 +    }
-+    ctx->acldvppDestroyStreamDesc(stream);
++    frame->pts     = (int64_t)vf->pts;
++    frame->pkt_dts = AV_NOPTS_VALUE;
++
++    if (avctx->pix_fmt == AV_PIX_FMT_ASCEND) {
++        ret = ascend_ensure_hw_frames(avctx, width, height);
++        if (ret < 0) {
++            out_pool_put(ctx, dev);
++            return ret;
++        }
++
++        atomic_fetch_add(&ctx->out_pool->refs, 1);
++        frame->buf[0] = av_buffer_create((uint8_t *)dev, copy_size,
++                                         ascend_dev_frame_free,
++                                         ctx->out_pool, 0);
++        if (!frame->buf[0]) {
++            out_pool_unref(ctx->out_pool);
++            out_pool_put(ctx, dev);
++            return AVERROR(ENOMEM);
++        }
++        frame->hw_frames_ctx = av_buffer_ref(avctx->hw_frames_ctx);
++        if (!frame->hw_frames_ctx) {
++            av_frame_unref(frame);
++            return AVERROR(ENOMEM);
++        }
++        frame->data[0]     = (uint8_t *)dev;
++        frame->linesize[0] = (int)stride_w;
++        frame->data[1]     = (uint8_t *)dev + y_size;
++        frame->linesize[1] = (int)stride_w;
++    } else {
++        ret = ascend_ensure_host_pool(ctx, copy_size);
++        if (ret < 0) {
++            out_pool_put(ctx, dev);
++            return ret;
++        }
++
++        frame->buf[0] = av_buffer_pool_get(ctx->host_frame_pool);
++        if (!frame->buf[0]) {
++            out_pool_put(ctx, dev);
++            return AVERROR(ENOMEM);
++        }
++
++        if (ctx->aclrtMemcpy(frame->buf[0]->data, copy_size,
++                             dev, copy_size,
++                             ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
++            out_pool_put(ctx, dev);
++            av_frame_unref(frame);
++            return AVERROR_EXTERNAL;
++        }
++        out_pool_put(ctx, dev);
++
++        frame->data[0]     = frame->buf[0]->data;
++        frame->linesize[0] = (int)stride_w;
++        frame->data[1]     = frame->buf[0]->data + y_size;
++        frame->linesize[1] = (int)stride_w;
++    }
 +    return 0;
++}
++
++/*
++ * Pull one completed frame from V2 VDEC.
++ * Returns:
++ *   0               - valid decoded frame written into `frame`
++ *   AVERROR(EAGAIN) - no ready frame within timeout_ms (corrupt frames discarded)
++ *   < 0             - fatal error
++ */
++static int ascend_pull_one_frame(AVCodecContext *avctx, AVFrame *frame, int timeout_ms)
++{
++    AscendDecodeContext *ctx = avctx->priv_data;
++    ff_hi_video_frame_info fi;
++    ff_hi_vdec_supplement_info sup;
++    ff_hi_vdec_stream ost;
++    ff_hi_s32 rc;
++
++    if (!ctx->channel_created)
++        return AVERROR(EAGAIN);
++
++    for (;;) {
++        memset(&fi, 0, sizeof(fi));
++        memset(&sup, 0, sizeof(sup));
++        memset(&ost, 0, sizeof(ost));
++
++        rc = ascend_mpi.hi_mpi_vdec_get_frame(ctx->active_chn, &fi, &sup, &ost, timeout_ms);
++        if (rc != 0) {
++            if ((ff_hi_u32)rc == FF_HI_ERR_VDEC_BUF_EMPTY)
++                return AVERROR(EAGAIN);
++            av_log(avctx, AV_LOG_DEBUG,
++                   "[Ascend] hi_mpi_vdec_get_frame(ch=%d) returned 0x%x\n",
++                   ctx->active_chn, (unsigned)rc);
++            return AVERROR(EAGAIN);
++        }
++
++        if (ost.addr) {
++            active_reclaim_in(ctx, ost.addr);
++            if (ctx->in_flight > 0)
++                ctx->in_flight--;
++        }
++        if (fi.v_frame.virt_addr[0])
++            active_remove_out(ctx, fi.v_frame.virt_addr[0]);
++
++        ascend_mpi.hi_mpi_vdec_release_frame(ctx->active_chn, &fi);
++
++        if (fi.v_frame.frame_flag == 0 && fi.v_frame.virt_addr[0] &&
++            fi.v_frame.width > 0 && fi.v_frame.height > 0) {
++            return ascend_wrap_output_frame(avctx, frame, &fi.v_frame);
++        }
++
++        if (fi.v_frame.virt_addr[0])
++            out_pool_put(ctx, fi.v_frame.virt_addr[0]);
++
++        av_log(avctx, AV_LOG_DEBUG,
++               "[Ascend] V2 VDEC dropped non-display/error frame (ch=%d, flag=0x%x)\n",
++               ctx->active_chn, fi.v_frame.frame_flag);
++
++        /* Non-blocking retry to check if another valid frame is already queued */
++        timeout_ms = 0;
++    }
 +}
 +
 +static int ascend_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 +{
 +    AscendDecodeContext *ctx = avctx->priv_data;
-+    AscendFrame item;
-+    int poll_waited = 0;
 +    int sent_pkt = 0;
-+    int waited_ms = 0;
 +    int ret;
 +
 +    if (!ctx->initialized)
 +        return AVERROR(EINVAL);
 +    if (ctx->context) {
-+        ret = ctx->aclrtSetCurrentContext(ctx->context);
-+        if (ret != ACL_SUCCESS)
++        if (ctx->aclrtSetCurrentContext(ctx->context) != ACL_SUCCESS)
 +            return AVERROR_EXTERNAL;
 +    }
 +
++    /* 1. Deliver any already-completed frame immediately with zero wait */
++    if (ctx->channel_created && ctx->in_flight > 0) {
++        ret = ascend_pull_one_frame(avctx, frame, 0);
++        if (ret != AVERROR(EAGAIN))
++            return ret;
++    }
++
++    /* 2. Feed new packets while pipeline has headroom */
 +    while (!ctx->eof_reached) {
-+        /*
-+         * Enforce VDEC in_flight and zero-copy DVPP surface-pool backpressure:
-+         * - When ready frames are already queued and either VDEC in_flight or
-+         *   the device surface pool is at cap, deliver a queued frame first so
-+         *   downstream threads drain and recycle surfaces without new mallocs.
-+         * - When the output queue is empty and in_flight is at ASCEND_MAX_INFLIGHT,
-+         *   wait on ctx->cond before pulling/submitting the next packet so we
-+         *   never return EAGAIN with avci->buffer_pkt unconsumed.
-+         */
-+        pthread_mutex_lock(&ctx->lock);
-+        if (ctx->queue_count > 0 &&
-+            (atomic_load(&ctx->in_flight) >= ASCEND_MAX_INFLIGHT ||
++        if (ctx->channel_created &&
++            (ctx->in_flight >= ASCEND_MAX_INFLIGHT ||
 +             (avctx->pix_fmt == AV_PIX_FMT_ASCEND && out_pool_at_cap(ctx)))) {
-+            pthread_mutex_unlock(&ctx->lock);
-+            break;
-+        }
-+        if (ctx->queue_count == 0 &&
-+            atomic_load(&ctx->in_flight) >= ASCEND_MAX_INFLIGHT) {
-+            int wait_loops = 0;
-+            while (ctx->queue_count == 0 &&
-+                   atomic_load(&ctx->in_flight) >= ASCEND_MAX_INFLIGHT &&
-+                   atomic_load(&ctx->running) && wait_loops++ < 50) {
-+                struct timespec ts;
-+                clock_gettime(CLOCK_REALTIME, &ts);
-+                ts.tv_nsec += 10 * 1000000L;
-+                if (ts.tv_nsec >= 1000000000L) {
-+                    ts.tv_sec++;
-+                    ts.tv_nsec -= 1000000000L;
-+                }
-+                pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
++            /* Backpressure: wait briefly for a decoded frame to free a slot */
++            for (int w = 0; w < 25 &&
++                 (ctx->in_flight >= ASCEND_MAX_INFLIGHT ||
++                  (avctx->pix_fmt == AV_PIX_FMT_ASCEND && out_pool_at_cap(ctx))); w++) {
++                ret = ascend_pull_one_frame(avctx, frame, 10);
++                if (ret != AVERROR(EAGAIN))
++                    return ret;
 +            }
-+            if (ctx->queue_count > 0) {
-+                pthread_mutex_unlock(&ctx->lock);
++            if (ctx->in_flight >= ASCEND_MAX_INFLIGHT)
 +                break;
-+            }
 +        }
-+        pthread_mutex_unlock(&ctx->lock);
 +
 +        ret = ff_decode_get_packet(avctx, ctx->pkt);
 +        if (ret == AVERROR_EOF) {
@@ -1262,178 +1434,43 @@
 +        if (ret < 0)
 +            return ret;
 +        sent_pkt = 1;
++
++        ret = ascend_pull_one_frame(avctx, frame, 0);
++        if (ret != AVERROR(EAGAIN))
++            return ret;
 +    }
 +
-+    for (;;) {
-+        pthread_mutex_lock(&ctx->lock);
-+        if (ctx->queue_count > 0) {
-+            item = ctx->queue[ctx->queue_head];
-+            ctx->queue_head = (ctx->queue_head + 1) % ASCEND_QUEUE_DEPTH;
-+            ctx->queue_count--;
-+            pthread_mutex_unlock(&ctx->lock);
++    /* 3. Non-EOF: short wait if pipeline is already primed, else return EAGAIN */
++    if (!ctx->eof_reached) {
++        if (sent_pkt && ctx->in_flight >= 4) {
++            ret = ascend_pull_one_frame(avctx, frame, 5);
++            if (ret != AVERROR(EAGAIN))
++                return ret;
++        }
++        return AVERROR(EAGAIN);
++    }
++
++    /* 4. EOF drain */
++    if (ctx->eos_done || !ctx->channel_created)
++        return AVERROR_EOF;
++
++    if (!ctx->eos_sent) {
++        ctx->eos_sent = 1;
++        ascend_send_eos(avctx);
++    }
++
++    for (int waited = 0; waited < 1000; ) {
++        int t = ctx->in_flight > 0 ? 50 : 5;
++        ret = ascend_pull_one_frame(avctx, frame, t);
++        if (ret != AVERROR(EAGAIN))
++            return ret;
++        if (ctx->in_flight <= 0)
 +            break;
-+        }
-+        if (ctx->eos_done) {
-+            pthread_mutex_unlock(&ctx->lock);
-+            return AVERROR_EOF;
-+        }
-+        if (!ctx->eof_reached) {
-+            if (sent_pkt && !poll_waited &&
-+                atomic_load(&ctx->in_flight) >= 8) {
-+                struct timespec ts;
-+                poll_waited = 1;
-+                clock_gettime(CLOCK_REALTIME, &ts);
-+                ts.tv_nsec += 5 * 1000000;
-+                if (ts.tv_nsec >= 1000000000) {
-+                    ts.tv_sec++;
-+                    ts.tv_nsec -= 1000000000;
-+                }
-+                pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
-+                if (ctx->queue_count > 0) {
-+                    pthread_mutex_unlock(&ctx->lock);
-+                    continue;
-+                }
-+            }
-+            pthread_mutex_unlock(&ctx->lock);
-+            return AVERROR(EAGAIN);
-+        }
-+        if (!ctx->eos_sent) {
-+            ctx->eos_sent = 1;
-+            pthread_mutex_unlock(&ctx->lock);
-+            ret = ascend_send_eos(avctx);
-+            if (ret < 0)
-+                return ret;
-+            continue;
-+        }
-+        if (!atomic_load(&ctx->in_flight)) {
-+            ctx->eos_done = 1;
-+            pthread_mutex_unlock(&ctx->lock);
-+            return AVERROR_EOF;
-+        }
-+        {
-+            struct timespec ts;
-+            clock_gettime(CLOCK_REALTIME, &ts);
-+            ts.tv_nsec += 50 * 1000000;
-+            if (ts.tv_nsec >= 1000000000) {
-+                ts.tv_sec++;
-+                ts.tv_nsec -= 1000000000;
-+            }
-+            pthread_cond_timedwait(&ctx->cond, &ctx->lock, &ts);
-+        }
-+        if (ctx->queue_count > 0) {
-+            pthread_mutex_unlock(&ctx->lock);
-+            continue;
-+        }
-+        waited_ms += 50;
-+        if (waited_ms >= 1000) {
-+            ctx->eos_done = 1;
-+            pthread_mutex_unlock(&ctx->lock);
-+            return AVERROR_EOF;
-+        }
-+        pthread_mutex_unlock(&ctx->lock);
++        waited += t;
 +    }
 +
-+    {
-+        void *dev = ctx->acldvppGetPicDescData(item.pic);
-+        uint32_t desc_w = ctx->acldvppGetPicDescWidth(item.pic);
-+        uint32_t desc_h = ctx->acldvppGetPicDescHeight(item.pic);
-+        uint32_t stride_w = ctx->acldvppGetPicDescWidthStride(item.pic);
-+        uint32_t stride_h = ctx->acldvppGetPicDescHeightStride(item.pic);
-+        int width = desc_w ? (avctx->width > 0 ? FFMIN(avctx->width, (int)desc_w) : (int)desc_w)
-+                           : (avctx->width > 0 ? avctx->width : 1920);
-+        int height = desc_h ? (avctx->height > 0 ? FFMIN(avctx->height, (int)desc_h) : (int)desc_h)
-+                            : (avctx->height > 0 ? avctx->height : 1080);
-+        int chroma_h;
-+        size_t y_size, uv_size, copy_size;
-+
-+        if (!dev || !stride_w || !stride_h || width <= 0 || height <= 0 ||
-+            stride_w < (uint32_t)width || stride_h < (uint32_t)height) {
-+            av_log(avctx, AV_LOG_ERROR,
-+                   "[Ascend] invalid output desc: %dx%d stride %ux%u\n",
-+                   width, height, stride_w, stride_h);
-+            ret = AVERROR_EXTERNAL;
-+            goto fail_pic;
-+        }
-+
-+        if (avctx->width <= 0 || avctx->height <= 0)
-+            ff_set_dimensions(avctx, width, height);
-+
-+        y_size = (size_t)stride_w * stride_h;
-+        chroma_h = (height + 1) / 2;
-+        uv_size = (size_t)stride_w * chroma_h;
-+        copy_size = y_size + uv_size;
-+
-+        frame->width  = width;
-+        frame->height = height;
-+        frame->format = avctx->pix_fmt;
-+        ret = ff_decode_frame_props(avctx, frame);
-+        if (ret < 0)
-+            goto fail_pic;
-+        frame->pts     = item.pts;
-+        frame->pkt_dts = item.dts;
-+
-+        if (avctx->pix_fmt == AV_PIX_FMT_ASCEND) {
-+            ret = ascend_ensure_hw_frames(avctx, width, height);
-+            if (ret < 0)
-+                goto fail_pic;
-+
-+            atomic_fetch_add(&ctx->out_pool->refs, 1);
-+            frame->buf[0] = av_buffer_create((uint8_t *)dev, copy_size,
-+                                             ascend_dev_frame_free,
-+                                             ctx->out_pool, 0);
-+            if (!frame->buf[0]) {
-+                out_pool_unref(ctx->out_pool);
-+                ret = AVERROR(ENOMEM);
-+                goto fail_pic;
-+            }
-+            frame->hw_frames_ctx = av_buffer_ref(avctx->hw_frames_ctx);
-+            if (!frame->hw_frames_ctx) {
-+                ret = AVERROR(ENOMEM);
-+                av_frame_unref(frame);
-+                ctx->acldvppDestroyPicDesc(item.pic);
-+                return ret;
-+            }
-+            frame->data[0]     = (uint8_t *)dev;
-+            frame->linesize[0] = (int)stride_w;
-+            frame->data[1]     = (uint8_t *)dev + y_size;
-+            frame->linesize[1] = (int)stride_w;
-+        } else {
-+            ret = ascend_ensure_host_pool(ctx, copy_size);
-+            if (ret < 0)
-+                goto fail_pic;
-+
-+            frame->buf[0] = av_buffer_pool_get(ctx->host_frame_pool);
-+            if (!frame->buf[0]) {
-+                ret = AVERROR(ENOMEM);
-+                goto fail_pic;
-+            }
-+
-+            if (ctx->aclrtMemcpy(frame->buf[0]->data, copy_size,
-+                                 dev, copy_size,
-+                                 ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
-+                ret = AVERROR_EXTERNAL;
-+                goto fail_pic;
-+            }
-+            out_pool_put(ctx, dev);
-+
-+            frame->data[0]     = frame->buf[0]->data;
-+            frame->linesize[0] = (int)stride_w;
-+            frame->data[1]     = frame->buf[0]->data + y_size;
-+            frame->linesize[1] = (int)stride_w;
-+        }
-+    }
-+    ctx->acldvppDestroyPicDesc(item.pic);
-+    return 0;
-+
-+fail_pic:
-+    {
-+        void *dev = ctx->acldvppGetPicDescData(item.pic);
-+        if (dev)
-+            out_pool_put(ctx, dev);
-+    }
-+    ctx->acldvppDestroyPicDesc(item.pic);
-+    av_frame_unref(frame);
-+    return ret;
++    ctx->eos_done = 1;
++    return AVERROR_EOF;
 +}
 +
 +static av_cold void ascend_flush(AVCodecContext *avctx)
@@ -1447,14 +1484,13 @@
 +        ctx->aclrtSetCurrentContext(ctx->context);
 +
 +    ascend_destroy_channel(ctx);
-+    queue_clear(ctx);
 +    if (ctx->pkt)
 +        av_packet_unref(ctx->pkt);
-+    atomic_store(&ctx->in_flight, 0);
 +    ctx->eof_reached = ctx->eos_sent = ctx->eos_done = 0;
++    ctx->extradata_sent = 0;
 +
 +    get_dimensions(avctx, &width, &height, &coded_w, &coded_h);
-+    if (coded_w > 0 && coded_h > 0 && !ctx->channel_desc)
++    if (coded_w > 0 && coded_h > 0 && !ctx->channel_created)
 +        ascend_create_channel(avctx, coded_w, coded_h);
 +}
 +
@@ -1466,18 +1502,18 @@
 +        AV_PIX_FMT_NV12,
 +        AV_PIX_FMT_NONE
 +    };
++    void *dvpp_lib_unused = NULL;
 +    int ret;
 +
-+    ctx->codec_id = avctx->codec_id;
-+    ctx->queue_head = ctx->queue_tail = ctx->queue_count = 0;
-+    ctx->in_pool_count = 0;
++    ctx->codec_id        = avctx->codec_id;
++    ctx->active_chn      = -1;
++    ctx->channel_created = 0;
++    ctx->in_pool_count   = 0;
++    ctx->in_active_count = 0;
++    ctx->out_active_count = 0;
++    ctx->in_flight       = 0;
 +    ctx->eof_reached = ctx->eos_sent = ctx->eos_done = 0;
-+    atomic_init(&ctx->running, 0);
-+    atomic_init(&ctx->in_flight, 0);
-+    atomic_init(&ctx->cb_count, 0);
-+    pthread_mutex_init(&ctx->lock, NULL);
-+    pthread_cond_init(&ctx->cond, NULL);
-+    pthread_cond_init(&ctx->thread_started, NULL);
++    ctx->extradata_sent  = 0;
 +
 +    if (avctx->hw_frames_ctx) {
 +        AVHWFramesContext *frames_ctx = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
@@ -1501,40 +1537,31 @@
 +    atomic_init(&cref->refs, 1);
 +    cref->device_id = ctx->device_id;
 +
-+    ret = av_ascend_global_acquire(ctx->device_id, &cref->acl_lib,
-+                                   &cref->dvpp_lib, (void **)&cref->context, avctx);
++    ret = av_ascend_global_acquire(ctx->device_id, &ctx->acl_lib,
++                                   &dvpp_lib_unused, (void **)&cref->context, avctx);
 +    if (ret < 0) {
 +        av_free(cref);
 +        return ret;
 +    }
-+    cref->aclrtSetCurrentContext = (void *)get_dyn_sym(cref->acl_lib, "aclrtSetCurrentContext");
-+    cref->acldvppFree            = (void *)get_dyn_sym(cref->dvpp_lib, "acldvppFree");
++    cref->aclrtSetCurrentContext = (void *)get_dyn_sym(ctx->acl_lib, "aclrtSetCurrentContext");
 +
-+    ctx->cref         = cref;
-+    ctx->context      = cref->context;
-+    ctx->acl_lib      = cref->acl_lib;
-+    ctx->dvpp_lib     = cref->dvpp_lib;
-+    ctx->acl_acquired = 1;
++    ctx->cref    = cref;
++    ctx->context = cref->context;
 +
-+    ret = load_symbols(avctx);
++    ret = load_acl_symbols(avctx);
 +    if (ret < 0)
 +        return ret;
 +
-+    ctx->out_pool = out_pool_alloc(ctx->cref);
++    ret = ensure_mpi_ready(avctx);
++    if (ret < 0)
++        return ret;
++
++    cref->hi_mpi_dvpp_free = ascend_mpi.hi_mpi_dvpp_free;
++
++    ctx->out_pool = out_pool_alloc(ctx->cref,
++                                   ctx->max_out_bufs > 0 ? ctx->max_out_bufs : ASCEND_MAX_OUT_BUFS);
 +    if (!ctx->out_pool)
 +        return AVERROR(ENOMEM);
-+
-+    atomic_store(&ctx->running, 1);
-+    ret = pthread_create(&ctx->callback_thread, NULL, ascend_callback_thread, ctx);
-+    if (ret) {
-+        atomic_store(&ctx->running, 0);
-+        av_log(avctx, AV_LOG_ERROR, "[Ascend] pthread_create failed: %d\n", ret);
-+        return AVERROR_EXTERNAL;
-+    }
-+    pthread_mutex_lock(&ctx->lock);
-+    while (!ctx->callback_thread_started)
-+        pthread_cond_wait(&ctx->thread_started, &ctx->lock);
-+    pthread_mutex_unlock(&ctx->lock);
 +
 +    avctx->sw_pix_fmt = AV_PIX_FMT_NV12;
 +    if (ctx->device_output) {
@@ -1558,11 +1585,11 @@
 +
 +    if (ctx->channel_id >= 0)
 +        av_log(avctx, AV_LOG_INFO,
-+               "[Ascend] DVPP decoder initialized (device=%d, channel=%d, pix_fmt=%s)\n",
++               "[Ascend] DVPP V2 decoder initialized (device=%d, channel=%d, pix_fmt=%s)\n",
 +               ctx->device_id, ctx->channel_id, av_get_pix_fmt_name(avctx->pix_fmt));
 +    else
 +        av_log(avctx, AV_LOG_INFO,
-+               "[Ascend] DVPP decoder initialized (device=%d, channel=auto, pix_fmt=%s)\n",
++               "[Ascend] DVPP V2 decoder initialized (device=%d, channel=auto, pix_fmt=%s)\n",
 +               ctx->device_id, av_get_pix_fmt_name(avctx->pix_fmt));
 +    return 0;
 +}
@@ -1575,12 +1602,6 @@
 +        ctx->aclrtSetCurrentContext(ctx->context);
 +
 +    ascend_destroy_channel(ctx);
-+    if (ctx->callback_thread_started) {
-+        atomic_store(&ctx->running, 0);
-+        pthread_join(ctx->callback_thread, NULL);
-+        ctx->callback_thread_started = 0;
-+    }
-+    queue_clear(ctx);
 +    out_pool_clear(ctx, 1);
 +    out_pool_unref(ctx->out_pool);
 +    ctx->out_pool = NULL;
@@ -1589,19 +1610,14 @@
 +    av_packet_free(&ctx->pkt);
 +    av_buffer_unref(&ctx->hw_frames_ref);
 +    av_buffer_unref(&ctx->hw_device_ref);
-+    atomic_store(&ctx->in_flight, 0);
 +    if (ctx->cref) {
 +        AscendContextRef *cref = ctx->cref;
 +        ctx->cref = NULL;
 +        ctx->context = NULL;
-+        ctx->acl_acquired = 0;
 +        ascend_cref_unref(cref);
 +    }
-+    ctx->dvpp_lib = ctx->acl_lib = NULL;
-+
-+    pthread_cond_destroy(&ctx->thread_started);
-+    pthread_cond_destroy(&ctx->cond);
-+    pthread_mutex_destroy(&ctx->lock);
++    ctx->acl_lib = NULL;
++    ctx->initialized = 0;
 +    return 0;
 +}
 +
@@ -1612,6 +1628,7 @@
 +    int device_id;
 +    int channel_id;
 +    int device_output;
++    int max_out_bufs;
 +} AscendDecodeContext;
 +
 +static av_cold int ascend_init_decoder(AVCodecContext *avctx)
@@ -1635,6 +1652,7 @@
 +    { "device_id",     "Ascend NPU device ID",              OFFSET(device_id),     AV_OPT_TYPE_INT,  { .i64 = 0 },  0, 63,  VD },
 +    { "channel_id",    "DVPP VDEC channel ID (-1 = auto)",  OFFSET(channel_id),    AV_OPT_TYPE_INT,  { .i64 = -1 }, -1, 255, VD },
 +    { "device_output", "Output AV_PIX_FMT_ASCEND device surfaces directly (zero D2H copy)", OFFSET(device_output), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
++    { "max_out_bufs",  "Max per-channel DVPP output surface pool size", OFFSET(max_out_bufs), AV_OPT_TYPE_INT, { .i64 = ASCEND_MAX_OUT_BUFS }, 4, ASCEND_OUT_POOL_SIZE, VD },
 +    { NULL }
 +};
 +
@@ -1667,7 +1685,7 @@
 +
 +const FFCodec ff_h264_ascend_decoder = {
 +    .p.name         = "h264_ascend",
-+    CODEC_LONG_NAME("Huawei Ascend DVPP H.264 hardware decoder"),
++    CODEC_LONG_NAME("Huawei Ascend DVPP V2 H.264 hardware decoder"),
 +    .p.type         = AVMEDIA_TYPE_VIDEO,
 +    .p.id           = AV_CODEC_ID_H264,
 +    .priv_data_size = sizeof(AscendDecodeContext),
@@ -1693,7 +1711,7 @@
 +
 +const FFCodec ff_hevc_ascend_decoder = {
 +    .p.name         = "hevc_ascend",
-+    CODEC_LONG_NAME("Huawei Ascend DVPP HEVC (H.265) hardware decoder"),
++    CODEC_LONG_NAME("Huawei Ascend DVPP V2 HEVC (H.265) hardware decoder"),
 +    .p.type         = AVMEDIA_TYPE_VIDEO,
 +    .p.id           = AV_CODEC_ID_HEVC,
 +    .priv_data_size = sizeof(AscendDecodeContext),
@@ -3133,7 +3151,7 @@
  /**
 --- /dev/null
 +++ b/libavutil/hwcontext_ascend.c
-@@ -0,0 +1,638 @@
+@@ -0,0 +1,640 @@
 +/*
 + * Huawei Ascend DVPP hardware context implementation.
 + *
@@ -3204,6 +3222,8 @@
 +    void *h = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
 +    const char *paths[] = {
 +        "/usr/local/Ascend/ascend-toolkit/latest/lib64",
++        "/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/lib64",
++        "/usr/local/Ascend/ascend-toolkit/latest/x86_64-linux/lib64",
 +        "/usr/local/Ascend/ascend-toolkit/latest/runtime/lib64",
 +        "/usr/local/Ascend/nnae/latest/lib64",
 +        "/usr/local/Ascend/driver/lib64",

@@ -49,6 +49,17 @@ fi
 
 install_apt_deps() {
     if ! command -v apt-get >/dev/null 2>&1; then return 0; fi
+    if [ "${USE_CN_MIRROR:-0}" = "1" ] || [ -n "${APT_MIRROR:-}" ]; then
+        local mirror="${APT_MIRROR:-http://mirrors.aliyun.com}"
+        mirror="${mirror%/}"
+        log "切换 APT 镜像源: ${mirror}"
+        $SUDO sed -i \
+            -e "s|http://ports.ubuntu.com/ubuntu-ports|${mirror}/ubuntu-ports|g" \
+            -e "s|https://ports.ubuntu.com/ubuntu-ports|${mirror}/ubuntu-ports|g" \
+            -e "s|http://archive.ubuntu.com/ubuntu|${mirror}/ubuntu|g" \
+            -e "s|http://security.ubuntu.com/ubuntu|${mirror}/ubuntu|g" \
+            /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list 2>/dev/null || true
+    fi
     log "安装系统构建依赖..."
     $SUDO apt-get update -qq
     $SUDO apt-get install -y -qq --no-install-recommends \
@@ -73,9 +84,33 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 fetch_tarball() {
-    rm -f "$2"
-    curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused -H "User-Agent: $UA" -o "$2" "$1" || fail "下载失败: $1"
-    [ -s "$2" ] || fail "下载为空: $1"
+    local url="$1"
+    local dst="$2"
+    local cache_file=""
+    if [ -n "${CACHE_DIR:-}" ]; then
+        mkdir -p "$CACHE_DIR"
+        cache_file="$CACHE_DIR/$(basename "$dst")"
+        if [ -s "$cache_file" ]; then
+            cp -f "$cache_file" "$dst"
+            return 0
+        fi
+    fi
+    rm -f "$dst"
+    local proxy="${GH_PROXY:-}"
+    if [ -z "$proxy" ] && [ "${USE_CN_MIRROR:-0}" = "1" ]; then
+        proxy="https://ghfast.top/"
+    fi
+    if [ -n "$proxy" ] && [[ "$url" == https://github.com/* || "$url" == https://api.github.com/* ]]; then
+        proxy="${proxy%/}/"
+        if curl -fsSL --connect-timeout 10 --retry 3 --retry-delay 2 -H "User-Agent: $UA" -o "$dst" "${proxy}${url}" && [ -s "$dst" ]; then
+            [ -n "$cache_file" ] && cp -f "$dst" "$cache_file"
+            return 0
+        fi
+        rm -f "$dst"
+    fi
+    curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused -H "User-Agent: $UA" -o "$dst" "$url" || fail "下载失败: $url"
+    [ -s "$dst" ] || fail "下载为空: $url"
+    [ -n "$cache_file" ] && cp -f "$dst" "$cache_file"
 }
 
 # 1. 硬件加速头文件
