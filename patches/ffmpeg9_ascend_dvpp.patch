@@ -155,12 +155,12 @@
 +
 +#define ASCEND_ALIGN_WIDTH    16
 +#define ASCEND_ALIGN_HEIGHT   2
-+#define ASCEND_MAX_INFLIGHT   12
++#define ASCEND_MAX_INFLIGHT   4
 +#define ASCEND_ACTIVE_SLOTS   (ASCEND_MAX_INFLIGHT + 4)
-+#define ASCEND_MAX_OUT_BUFS   16
++#define ASCEND_MAX_OUT_BUFS   6
 +#define ASCEND_OUT_POOL_SIZE  32
-+#define ASCEND_IN_POOL_SIZE   (ASCEND_MAX_INFLIGHT + 4)
-+#define ASCEND_IN_MIN_ALLOC   (256 * 1024)
++#define ASCEND_IN_POOL_SIZE   (ASCEND_MAX_INFLIGHT + 2)
++#define ASCEND_IN_MIN_ALLOC   (128 * 1024)
 +
 +/* CANN DVPP V2 MPI ABI constants (verified against CANN 9.2.1 hi_dvpp_vdec.h) */
 +#define FF_HI_VDEC_MAX_CHN_NUM        256
@@ -583,7 +583,7 @@
 +    if (!p || !dev)
 +        return;
 +    pthread_mutex_lock(&p->lock);
-+    if (!p->closed && p->count < ASCEND_OUT_POOL_SIZE) {
++    if (!p->closed && p->count < p->max_bufs && p->allocated <= p->max_bufs) {
 +        p->bufs[p->count++] = dev;
 +        pthread_cond_signal(&p->cond);
 +        pthread_mutex_unlock(&p->lock);
@@ -1442,7 +1442,7 @@
 +
 +    /* 3. Non-EOF: short wait if pipeline is already primed, else return EAGAIN */
 +    if (!ctx->eof_reached) {
-+        if (sent_pkt && ctx->in_flight >= 4) {
++        if (sent_pkt && ctx->in_flight >= 2) {
 +            ret = ascend_pull_one_frame(avctx, frame, 5);
 +            if (ret != AVERROR(EAGAIN))
 +                return ret;
