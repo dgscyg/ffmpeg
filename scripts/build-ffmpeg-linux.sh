@@ -103,14 +103,18 @@ fetch_tarball() {
     if [ -n "$proxy" ] && [[ "$url" == https://github.com/* || "$url" == https://api.github.com/* ]]; then
         proxy="${proxy%/}/"
         if curl -fsSL --connect-timeout 10 --retry 3 --retry-delay 2 -H "User-Agent: $UA" -o "$dst" "${proxy}${url}" && [ -s "$dst" ]; then
-            [ -n "$cache_file" ] && cp -f "$dst" "$cache_file"
+            if [ -n "$cache_file" ]; then
+                cp -f "$dst" "$cache_file"
+            fi
             return 0
         fi
         rm -f "$dst"
     fi
     curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused -H "User-Agent: $UA" -o "$dst" "$url" || fail "下载失败: $url"
     [ -s "$dst" ] || fail "下载为空: $url"
-    [ -n "$cache_file" ] && cp -f "$dst" "$cache_file"
+    if [ -n "$cache_file" ]; then
+        cp -f "$dst" "$cache_file"
+    fi
 }
 
 # 1. 硬件加速头文件
